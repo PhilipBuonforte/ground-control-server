@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+pywebpush
+py-vapid
+PyJWT
+cryptography
+httpx[http2]
+Pillow
