@@ -996,12 +996,34 @@ def _apns_jwt(conf):
     )
 
 
+RELAY_URL = "http://165.22.145.29:8132/push"
+
+
 def send_apns(title, body, dir_="", sid="", badge=None):
-    """Send a push to every registered device via APNs HTTP/2."""
-    conf = _apns_conf()
+    """Send a push to every registered device via APNs HTTP/2.
+
+    If this Mac has no APNs signing key (every user except the app owner),
+    deliver through the Ground Control relay instead — zero user setup,
+    same as any mainstream app's notification server."""
     tokens = _apns_tokens()
-    if not conf or not APNS_KEY_PATH.exists() or not tokens:
+    if not tokens:
         return 0
+    conf = _apns_conf()
+    if not conf or not APNS_KEY_PATH.exists():
+        import httpx
+
+        sent = 0
+        with httpx.Client(timeout=10) as client:
+            for tok in tokens:
+                try:
+                    r = client.post(RELAY_URL, json={
+                        "token": tok, "title": title, "body": body,
+                        "dir": dir_, "id": sid, "badge": badge})
+                    if r.status_code == 200:
+                        sent += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        return sent
     import httpx
 
     auth = _apns_jwt(conf)
