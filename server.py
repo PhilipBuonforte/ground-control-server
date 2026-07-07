@@ -1013,11 +1013,15 @@ def send_apns(title, body, dir_="", sid="", badge=None):
         import httpx
 
         sent = 0
+        # Privacy: relay alerts carry NO conversation content — only the
+        # session name and a generic line. Full content stays on the user's
+        # own devices and tailnet.
+        generic = "Tap to view" if body else ""
         with httpx.Client(timeout=10) as client:
             for tok in tokens:
                 try:
                     r = client.post(RELAY_URL, json={
-                        "token": tok, "title": title, "body": body,
+                        "token": tok, "title": title, "body": generic,
                         "dir": dir_, "id": sid, "badge": badge})
                     if r.status_code == 200:
                         sent += 1

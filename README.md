@@ -44,3 +44,14 @@ Live push alerts (buzz your phone when a session finishes) are enabled for the
 primary developer build. In this early TestFlight, the in-app session list,
 messaging, attachments, and working-status all work for everyone; broader
 push support is coming.
+
+## Privacy
+
+Your conversations never leave your own devices. The app talks directly to
+**your** Mac over **your** private Tailscale network — messages, files, and
+session content are never sent to us or anyone else.
+
+The only thing that touches Ground Control's servers is the notification
+ping: your Mac asks our push relay to buzz your phone with the **session
+name only** (e.g. "✅ My Project — Tap to view"). No message content is ever
+included, and nothing is stored.
