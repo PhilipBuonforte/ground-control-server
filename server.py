@@ -2564,7 +2564,13 @@ def delete_group(group_id: str):
 
 # ---------------------------------------------------------------- push
 
-VAPID = json.load(open(Path(__file__).parent / "vapid.json"))
+# Legacy PWA web-push keys. OPTIONAL: fresh installs don't have them (native apps
+# alert via the APNs relay instead) — loading unconditionally crashed the server at
+# boot on every new user's Mac. Missing file → feature quietly off.
+try:
+    VAPID = json.load(open(Path(__file__).parent / "vapid.json"))
+except (OSError, json.JSONDecodeError):
+    VAPID = {}
 SUBS_PATH = Path(__file__).parent / "subscriptions.json"
 
 
@@ -2583,6 +2589,8 @@ def _save_subs(subs):
 
 @app.get("/api/vapid-public")
 def vapid_public():
+    if not VAPID:
+        return JSONResponse({"error": "web-push not configured"}, status_code=404)
     return {"key": VAPID["public_key"]}
 
 
@@ -2601,8 +2609,15 @@ def subscribe(body: SubBody):
 
 
 def send_push(title: str, msg: str, dir_: str = "", sid: str = ""):
-    """Send a web-push notification to all subscribed devices."""
-    from pywebpush import webpush, WebPushException
+    """Send a web-push notification to all subscribed devices. No-op when the
+    legacy web-push keys aren't configured (fresh installs — native apps use the
+    APNs relay) or pywebpush isn't installed."""
+    if not VAPID:
+        return 0
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        return 0
 
     subs = _load_subs()
     if not subs:
