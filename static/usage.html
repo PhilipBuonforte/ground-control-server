@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ground Control — Usage</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --card2:#232733; --text:#e8eaed; --dim:#8b91a0;
+          --opus:#d97757; --sonnet:#5b8def; --haiku:#4caf7d; --fable:#b968d9; --border:#2a2e3a; }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { background:var(--bg); color:var(--text); font:15px/1.4 -apple-system,"SF Pro Text",sans-serif;
+         padding:16px; max-width:900px; margin:0 auto; padding-bottom:60px; }
+  h1 { font-size:22px; font-weight:800; margin-bottom:2px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:16px; }
+  .filters { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+  .filters button { background:var(--card); color:var(--dim); border:1px solid var(--border);
+                    border-radius:20px; padding:7px 14px; font-size:13px; font-weight:600; }
+  .filters button.active { background:var(--opus); color:#fff; border-color:var(--opus); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:20px; }
+  .kpi { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; }
+  .kpi .lbl { color:var(--dim); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .kpi .val { font-size:26px; font-weight:800; margin-top:4px; }
+  .kpi .note { color:var(--dim); font-size:12px; margin-top:2px; }
+  .kpi.warn .val { color:var(--opus); }
+  .section { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:16px; }
+  .section h2 { font-size:14px; font-weight:700; margin-bottom:12px; }
+  canvas { width:100%; height:auto; display:block; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:10px; font-size:12px; color:var(--dim); }
+  .legend span { display:inline-flex; align-items:center; gap:5px; }
+  .dot { width:10px; height:10px; border-radius:3px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--dim); font-weight:600; padding:8px 6px; border-bottom:1px solid var(--border); font-size:11px; text-transform:uppercase; cursor:pointer; }
+  td { padding:8px 6px; border-bottom:1px solid var(--border); }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .bar { height:6px; border-radius:3px; background:var(--opus); }
+  .modelpill { font-size:11px; padding:2px 7px; border-radius:6px; font-weight:600; }
+  .empty { color:var(--dim); text-align:center; padding:40px; }
+  .banner { background:var(--card2); border:1px solid var(--border); border-radius:12px; padding:12px 14px; font-size:13px; color:var(--dim); margin-bottom:16px; }
+  .banner b { color:var(--text); }
+  a { color:var(--sonnet); }
+</style>
+</head>
+<body>
+  <h1>Usage Command Center</h1>
+  <div class="sub" id="sub">Loading…</div>
+
+  <div class="filters" id="filters">
+    <button data-d="1">Today</button>
+    <button data-d="7" class="active">7 days</button>
+    <button data-d="30">30 days</button>
+    <button data-d="90">90 days</button>
+  </div>
+
+  <div class="banner">
+    <b>Heads up:</b> your real "credits left / % of Max limit" lives in
+    <a href="https://claude.ai/settings/usage" target="_blank">Settings → Usage</a> — it's not on your Mac.
+    This shows what's <b>driving</b> that number: tokens, models, and burn rate from your own transcripts.
+  </div>
+
+  <div class="section" style="border-color:var(--opus)">
+    <h2>Live plan limits <span style="color:var(--dim);font-weight:400">— straight from Anthropic (matches Settings→Usage exactly)</span></h2>
+    <div id="realLimits"><div class="empty">Loading real limits…</div></div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="section">
+    <h2>Live — last 15 messages</h2>
+    <table><tbody id="liveFeed"></tbody></table>
+  </div>
+
+  <div class="section">
+    <h2>Tokens over time</h2>
+    <canvas id="timeChart" width="860" height="220"></canvas>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--opus)"></span>Opus (heavy)</span>
+      <span><span class="dot" style="background:var(--sonnet)"></span>Sonnet</span>
+      <span><span class="dot" style="background:var(--haiku)"></span>Haiku</span>
+      <span><span class="dot" style="background:var(--fable)"></span>Fable</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>By model</h2>
+    <div id="modelBars"></div>
+  </div>
+
+  <div class="section">
+    <h2>By session <span style="color:var(--dim);font-weight:400">— tap a header to sort</span></h2>
+    <table id="sessTable"><thead><tr>
+      <th data-k="session">Session</th>
+      <th data-k="model">Model</th>
+      <th class="num" data-k="total">Tokens</th>
+      <th class="num" data-k="msgs">Msgs</th>
+      <th class="num" data-k="avg">Avg/msg</th>
+    </tr></thead><tbody id="sessBody"></tbody></table>
+  </div>
+
+<script>
+let DATA = null, DAYS = 7, sortKey = "total", sortDir = -1;
+async function loadLimits() {
+  try {
+    const r = await fetch("/api/limits");
+    const d = await r.json();
+    renderLimits(d);
+  } catch (e) {
+    document.getElementById("realLimits").innerHTML = '<div class="empty">Couldn\'t reach limits API.</div>';
+  }
+}
+
+function limitRow(label, pct, resetIso, note) {
+  const color = pct >= 90 ? "#e5484d" : pct >= 70 ? "#f5a623" : "#4caf7d";
+  let reset = "";
+  if (resetIso) {
+    const secs = (new Date(resetIso).getTime() - Date.now())/1000;
+    if (secs > 0) {
+      const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60);
+      reset = h > 0 ? `resets in ${h}h ${m}m` : `resets in ${m}m`;
+    } else reset = "resetting…";
+  }
+  return `<div style="margin-bottom:14px">
+    <div style="display:flex;justify-content:space-between;font-size:14px;margin-bottom:5px">
+      <b>${label}</b><span style="color:${color};font-weight:800">${pct}%</span></div>
+    <div style="height:12px;background:var(--card2);border-radius:6px;overflow:hidden">
+      <div style="height:100%;width:${Math.min(100,pct)}%;background:${color};border-radius:6px"></div></div>
+    <div style="color:var(--dim);font-size:12px;margin-top:4px">${[reset,note].filter(Boolean).join(" · ")}</div>
+  </div>`;
+}
+
+function renderLimits(d) {
+  if (d.error) {
+    document.getElementById("realLimits").innerHTML =
+      `<div class="empty">Live limits unavailable (${d.error}). The transcript estimates below still work.</div>`;
+    return;
+  }
+  let html = "";
+  if (d.five_hour) html += limitRow("5-hour session", Math.round(d.five_hour.utilization), d.five_hour.resets_at, "the meter that locks you out");
+  (d.limits||[]).forEach(l=>{
+    if (l.kind === "session") return;
+    const name = l.kind==="weekly_all" ? "Weekly · all models"
+      : l.scope?.model?.display_name ? `Weekly · ${l.scope.model.display_name}`
+      : "Weekly";
+    html += limitRow(name, l.percent, l.resets_at, l.severity==="critical"?"⚠︎ critical":"");
+  });
+  const ex = d.extra_usage;
+  if (ex && ex.used_credits != null) {
+    const used = ex.used_credits / Math.pow(10, ex.decimal_places||2);
+    html += `<div style="margin-top:6px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="display:flex;justify-content:space-between;font-size:14px">
+        <b>Extra-usage credits spent</b>
+        <span style="font-weight:800;color:var(--opus)">$${used.toLocaleString(undefined,{minimumFractionDigits:2})}</span></div>
+      <div style="color:var(--dim);font-size:12px;margin-top:4px">${ex.is_enabled?"pay-as-you-go is ON — spending past your plan":"pay-as-you-go off"}</div></div>`;
+  }
+  document.getElementById("realLimits").innerHTML = html || '<div class="empty">No limit data.</div>';
+}
+const MC = { opus:"#d97757", sonnet:"#5b8def", haiku:"#4caf7d", fable:"#b968d9", other:"#8b91a0" };
+const fmt = n => n>=1e9?(n/1e9).toFixed(2)+"B":n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?(n/1e3).toFixed(1)+"k":Math.round(n);
+
+async function load() {
+  document.getElementById("sub").textContent = "Loading…";
+  const r = await fetch("/api/usage?days=" + DAYS);
+  DATA = await r.json();
+  render();
+}
+
+function render() {
+  const ev = DATA.events;
+  if (!ev.length) { document.getElementById("sub").textContent = "No usage in this window."; document.getElementById("cards").innerHTML=""; return; }
+  const now = DATA.now;
+  const total = ev.reduce((s,e)=>s+e.total,0);
+  const opus = ev.filter(e=>e.model==="opus").reduce((s,e)=>s+e.total,0);
+  const opusPct = Math.round(opus/total*100);
+  // burn rate: tokens in the last rolling hour of activity, extrapolated
+  const hourAgo = now - 3600;
+  const lastHr = ev.filter(e=>e.ts>=hourAgo).reduce((s,e)=>s+e.total,0);
+  // 5-hour window consumption (what Max actually rate-limits on)
+  const win = now - 5*3600;
+  const winTot = ev.filter(e=>e.ts>=win).reduce((s,e)=>s+e.weighted,0);
+  document.getElementById("sub").textContent = ev.length.toLocaleString() + " messages · " + DAYS + "-day window";
+
+  card([
+    ["Total tokens", fmt(total), DAYS+"-day window"],
+    ["Opus share", opusPct+"%", opusPct>60?"⚠︎ heavy — this drains your limit":"of all tokens", opusPct>60],
+    ["Last-hour burn", fmt(lastHr), "tokens in past 60 min"],
+    ["5-hr window load", fmt(winTot), "allowance-weighted", winTot>3e6],
+  ]);
+
+  liveFeed(ev);
+  drawTime(ev, now);
+  modelBars(ev, total);
+  sessionTable(ev);
+}
+
+function liveFeed(ev) {
+  const recent = ev.slice(-15).reverse();
+  document.getElementById("liveFeed").innerHTML = recent.map(e=>{
+    const t = new Date(e.ts*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+    return `<tr>
+      <td style="color:var(--dim);width:60px">${t}</td>
+      <td><span class="modelpill" style="background:${MC[e.model]}22;color:${MC[e.model]}">${e.model}</span></td>
+      <td style="color:var(--dim);font-size:12px">${e.session}</td>
+      <td class="num" style="font-weight:700">${fmt(e.total)}</td></tr>`;
+  }).join("");
+}
+
+function card(rows) {
+  document.getElementById("cards").innerHTML = rows.map(([l,v,n,warn])=>
+    `<div class="kpi ${warn?'warn':''}"><div class="lbl">${l}</div><div class="val">${v}</div><div class="note">${n}</div></div>`).join("");
+}
+
+function drawTime(ev, now) {
+  const c = document.getElementById("timeChart"), ctx = c.getContext("2d");
+  const W=c.width, H=c.height, pad=30;
+  ctx.clearRect(0,0,W,H);
+  const span = DAYS*86400, start = now - span;
+  const buckets = DAYS<=1?24:DAYS<=7?DAYS*4:DAYS;
+  const bw = span/buckets;
+  const models = ["opus","sonnet","haiku","fable"];
+  const grid = Array.from({length:buckets},()=>({opus:0,sonnet:0,haiku:0,fable:0}));
+  ev.forEach(e=>{ const b=Math.floor((e.ts-start)/bw); if(b>=0&&b<buckets&&grid[b][e.model]!==undefined) grid[b][e.model]+=e.total; });
+  const max = Math.max(1,...grid.map(g=>models.reduce((s,m)=>s+g[m],0)));
+  const cw = (W-pad*2)/buckets;
+  grid.forEach((g,i)=>{
+    let y = H-20;
+    const x = pad + i*cw;
+    models.forEach(m=>{
+      const h = g[m]/max*(H-40);
+      if(h>0){ ctx.fillStyle=MC[m]; ctx.fillRect(x, y-h, cw*0.8, h); y-=h; }
+    });
+  });
+  ctx.fillStyle="#8b91a0"; ctx.font="10px -apple-system";
+  ctx.fillText(new Date(start*1000).toLocaleDateString(), pad, H-6);
+  ctx.fillText("now", W-pad-16, H-6);
+  ctx.fillText(fmt(max)+"/bucket", pad, 12);
+}
+
+function modelBars(ev, total) {
+  const by = {};
+  ev.forEach(e=>{ by[e.model]=(by[e.model]||0)+e.total; });
+  const rows = Object.entries(by).sort((a,b)=>b[1]-a[1]);
+  document.getElementById("modelBars").innerHTML = rows.map(([m,v])=>{
+    const pct = (v/total*100);
+    return `<div style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
+        <span style="color:${MC[m]};font-weight:700;text-transform:capitalize">${m}</span>
+        <span style="color:var(--dim)">${fmt(v)} · ${pct.toFixed(0)}%</span></div>
+      <div style="height:8px;background:var(--card2);border-radius:4px;overflow:hidden">
+        <div style="height:100%;width:${pct}%;background:${MC[m]}"></div></div></div>`;
+  }).join("");
+}
+
+function sessionTable(ev) {
+  const by = {};
+  ev.forEach(e=>{
+    const k = e.session+"||"+e.project;
+    if(!by[k]) by[k]={session:e.session, project:e.project, model:{}, total:0, msgs:0};
+    by[k].total+=e.total; by[k].msgs++;
+    by[k].model[e.model]=(by[k].model[e.model]||0)+e.total;
+  });
+  let rows = Object.values(by).map(r=>{
+    r.topModel = Object.entries(r.model).sort((a,b)=>b[1]-a[1])[0][0];
+    r.avg = r.total/r.msgs;
+    return r;
+  });
+  rows.sort((a,b)=>{ let x=a[sortKey], y=b[sortKey]; if(typeof x==="string") return sortDir*x.localeCompare(y); return sortDir*(x-y); });
+  const max = Math.max(...rows.map(r=>r.total));
+  document.getElementById("sessBody").innerHTML = rows.map(r=>`
+    <tr><td>${r.session}<div style="height:4px;margin-top:3px;border-radius:2px;background:${MC[r.topModel]};width:${r.total/max*100}%"></div>
+        <span style="color:var(--dim);font-size:11px">${r.project}</span></td>
+    <td><span class="modelpill" style="background:${MC[r.topModel]}22;color:${MC[r.topModel]}">${r.topModel}</span></td>
+    <td class="num">${fmt(r.total)}</td><td class="num">${r.msgs}</td><td class="num">${fmt(r.avg)}</td></tr>`).join("");
+}
+
+document.getElementById("filters").addEventListener("click", e=>{
+  if(e.target.dataset.d){ DAYS=+e.target.dataset.d;
+    [...document.querySelectorAll("#filters button")].forEach(b=>b.classList.toggle("active",b===e.target));
+    load(); }
+});
+document.querySelectorAll("#sessTable th").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.k; if(sortKey===k) sortDir*=-1; else {sortKey=k; sortDir=-1;} sessionTable(DATA.events);
+});
+load();
+loadLimits();
+setInterval(load, 60000);
+setInterval(loadLimits, 60000);
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+# runtime state — created by the server, never committed
+venv/
+__pycache__/
+*.log
+*.err
+uploads/
+*.json
+!manifest.json

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ground Zero</title>
+<style>
+  :root{
+    --paper:#FAF9F5; --card:#fff; --ink:#2b2b28; --muted:#8a8578;
+    --clay:#D97757; --clay-dim:#e9c4b4; --line:#eae6de;
+    --live:#3f9d5a; --busy:#D97757;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--paper);color:var(--ink);
+    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    padding:max(16px,env(safe-area-inset-top)) 16px 40px}
+  .head{display:flex;align-items:center;gap:10px;margin:4px 0 4px}
+  h1{font-size:19px;font-weight:800;letter-spacing:.5px;margin:0}
+  .sub{color:var(--muted);font-size:12.5px;margin:0 0 18px}
+  .beat{width:11px;height:11px;border-radius:50%;background:var(--muted);flex:0 0 auto}
+  .beat.on{background:var(--clay);box-shadow:0 0 0 4px rgba(217,119,87,.18)}
+  .meta{margin-left:auto;font:12px ui-monospace,Menlo,monospace;color:var(--muted);text-align:right}
+  .sec{font-size:11px;font-weight:800;letter-spacing:1px;color:var(--muted);
+    text-transform:uppercase;margin:22px 2px 8px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:13px 14px;margin-bottom:10px;display:flex;align-items:center;gap:13px}
+  .light{width:14px;height:14px;border-radius:50%;flex:0 0 auto;background:var(--muted)}
+  .light.live{background:var(--live)}
+  .light.busy{background:var(--busy);animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(.55);opacity:.4}}
+  .body{flex:1;min-width:0}
+  .title{font-weight:700;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .proj{color:var(--muted);font-weight:500}
+  .row2{margin-top:3px;font:12px ui-monospace,Menlo,monospace;color:var(--muted);
+    display:flex;gap:14px;flex-wrap:wrap}
+  .row2 b{color:var(--ink);font-weight:700}
+  .state{font:12px ui-monospace,Menlo,monospace;font-weight:800;flex:0 0 auto;text-align:right}
+  .state.busy{color:var(--busy)}
+  .state.idle{color:var(--live)}
+  .empty{color:var(--muted);font-size:13px;padding:8px 2px}
+  .err{color:#c0392b;font-weight:700}
+  .pid{font-family:ui-monospace,Menlo,monospace}
+</style>
+</head>
+<body>
+  <div class="head">
+    <div class="beat" id="beat"></div>
+    <h1>GROUND ZERO</h1>
+    <div class="meta" id="meta">connecting…</div>
+  </div>
+  <p class="sub">The real headless <span class="pid">claude</span> processes on this Mac — read straight from the OS, not the transcript. If a light is pulsing clay, it's actively generating right now.</p>
+
+  <div class="sec">Owned by Ground Control · headless</div>
+  <div id="owned"><div class="empty">…</div></div>
+
+  <div class="sec">Running elsewhere · Claude desktop / terminal</div>
+  <div id="external"><div class="empty">…</div></div>
+
+<script>
+let lastData=null, lastFetchOk=false;
+function fmtDur(s){ if(s==null) return "—"; s=Math.max(0,s|0);
+  const m=Math.floor(s/60), ss=s%60; if(m<60) return m+":"+String(ss).padStart(2,"0");
+  const h=Math.floor(m/60); return h+"h"+String(m%60).padStart(2,"0")+"m"; }
+function esc(t){const d=document.createElement("div");d.textContent=t==null?"":t;return d.innerHTML;}
+
+function render(){
+  if(!lastData) return;
+  // uptime/idle tick locally between fetches using clientTime offset
+  const drift = (Date.now()/1000) - lastData._clientNow;
+  const owned=lastData.owned||[], ext=lastData.external||[];
+  const oEl=document.getElementById("owned");
+  if(!owned.length){ oEl.innerHTML='<div class="empty">No headless sessions running right now.</div>'; }
+  else oEl.innerHTML=owned.map(o=>{
+    const up=fmtDur((o.uptime||0)+drift);
+    const idle=o.busy?null:fmtDur((o.idle||0)+drift);
+    const lc=o.busy?"busy":"live", st=o.busy?"busy":"idle";
+    return `<div class="card">
+      <div class="light ${lc}"></div>
+      <div class="body">
+        <div class="title">${esc(o.title)} ${o.project?`<span class="proj">· ${esc(o.project)}</span>`:""}</div>
+        <div class="row2"><span>pid <b>${o.pid}</b></span><span>up <b>${up}</b></span>${o.busy?`<span>queue <b>${o.pending_turns}</b></span>`:`<span>idle <b>${idle}</b></span>`}<span>${esc((o.model||"").replace("claude-",""))}</span></div>
+      </div>
+      <div class="state ${st}">${o.busy?"● WORKING":"○ idle"}</div>
+    </div>`;
+  }).join("");
+  const eEl=document.getElementById("external");
+  if(!ext.length){ eEl.innerHTML='<div class="empty">None.</div>'; }
+  else eEl.innerHTML=ext.map(o=>{
+    const st=o.working?"busy":"idle";
+    return `<div class="card">
+      <div class="light ${o.working?"busy":"live"}"></div>
+      <div class="body">
+        <div class="title">${esc(o.title)} ${o.project?`<span class="proj">· ${esc(o.project)}</span>`:""}</div>
+        <div class="row2"><span>pid <b>${o.pid}</b></span><span>not owned by GC</span></div>
+      </div>
+      <div class="state ${st}">${o.working?"● working":"○ idle"}</div>
+    </div>`;
+  }).join("");
+}
+
+async function tick(){
+  const beat=document.getElementById("beat"), meta=document.getElementById("meta");
+  try{
+    const r=await fetch("/api/groundzero",{cache:"no-store"});
+    const d=await r.json();
+    d._clientNow=Date.now()/1000;
+    lastData=d; lastFetchOk=true;
+    const n=(d.owned||[]).length, b=(d.owned||[]).filter(x=>x.busy).length;
+    meta.innerHTML=`server pid <b style="color:var(--ink)">${d.server_pid}</b> · ${n} headless · ${b} working`;
+    beat.classList.add("on"); setTimeout(()=>beat.classList.remove("on"),350);
+  }catch(e){
+    lastFetchOk=false;
+    meta.innerHTML='<span class="err">server unreachable</span>';
+  }
+  render();
+}
+setInterval(tick,1500);
+setInterval(render,1000); // tick uptimes smoothly between fetches
+tick();
+</script>
+</body>
+</html>

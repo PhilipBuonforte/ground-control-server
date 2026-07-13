@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>How Alerts Work</title>
+<style>
+  :root { --clay:#D97757; --bg:#faf9f5; --panel:#fff; --ink:#1f1c18; --muted:#8a8378; --line:#e6e1d6; --green:#3f9d5a; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    padding:env(safe-area-inset-top) 0 40px; }
+  .wrap { max-width:620px; margin:0 auto; padding:20px 18px; }
+  h1 { font-size:22px; margin:6px 0 2px; }
+  .sub { color:var(--muted); font-size:13.5px; margin-bottom:22px; }
+  .step { background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    padding:14px 16px; margin:0 0 10px; box-shadow:0 1px 2px rgba(0,0,0,.03); }
+  .step h3 { margin:0 0 4px; font-size:15px; display:flex; align-items:center; gap:9px; }
+  .step p { margin:0; color:#4a463f; font-size:13.5px; }
+  .num { flex:0 0 auto; width:23px; height:23px; border-radius:50%; background:var(--clay);
+    color:#fff; font-size:12.5px; font-weight:800; display:flex; align-items:center; justify-content:center; }
+  .arrow { text-align:center; color:var(--muted); font-size:17px; margin:-2px 0 8px; }
+  .gate { border-left:3px solid var(--clay); }
+  .off { border-left:3px solid var(--green); }
+  .off .num { background:var(--green); }
+  .pill { display:inline-block; font-size:11.5px; font-weight:700; padding:2px 8px; border-radius:20px;
+    background:#f0ece3; color:var(--muted); margin-left:6px; }
+  ul { margin:6px 0 0; padding-left:18px; } li { margin:2px 0; font-size:13.5px; color:#4a463f; }
+  b { color:var(--ink); }
+  .hdr { font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:.5px;
+    color:var(--muted); margin:24px 0 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>How alerts work</h1>
+  <div class="sub">The exact flow that decides when Ground Control buzzes, repeats, calls — and what turns it all off.</div>
+
+  <div class="hdr">What starts an alert</div>
+
+  <div class="step">
+    <h3><span class="num">1</span> A session reaches a stopping point</h3>
+    <p>Claude finishes its turn (<b>Stop</b> hook) or pauses to ask you something (<b>Notification</b> hook). This <i>arms</i> a pending alert — it hasn't fired yet.</p>
+  </div>
+  <div class="arrow">↓</div>
+
+  <div class="step gate">
+    <h3><span class="num">2</span> Wait for 5 seconds of quiet <span class="pill">debounce</span></h3>
+    <p>Claude often pauses a couple seconds then keeps going on its own. So we wait: the session must sit <b>continuously idle for 5s</b>. If <b>anything</b> starts again — the main turn, a background sub‑agent, a shell — the 5‑second clock <b>restarts</b>. No more "alert, but it's still running."</p>
+  </div>
+  <div class="arrow">↓</div>
+
+  <div class="hdr">Gates it must pass to fire</div>
+
+  <div class="step gate">
+    <h3><span class="num">3</span> You haven't already replied</h3>
+    <p>If you sent a new message since it stopped, the stale alert is dropped (you're clearly on it).</p>
+  </div>
+  <div class="step gate">
+    <h3><span class="num">4</span> It's a session you're waiting on</h3>
+    <p>Only sessions you've <b>sent to</b> can alert — so random autonomous sessions stay silent. Override with <b>Always alert</b> in settings to buzz for every session.</p>
+  </div>
+  <div class="step gate">
+    <h3><span class="num">5</span> Not muted</h3>
+    <p>If you've silenced alerts for a while, nothing fires.</p>
+  </div>
+  <div class="arrow">↓</div>
+
+  <div class="hdr">What you get</div>
+
+  <div class="step">
+    <h3><span class="num">6</span> 🔔 The alert fires</h3>
+    <p>A push on your <b>phone</b> and a native notification on your <b>Mac</b>. The session is marked <b>unread</b>.</p>
+  </div>
+  <div class="step">
+    <h3><span class="num">7</span> 🔁 Repeats</h3>
+    <p>While it's still unread, you get re‑nudged on your chosen interval (e.g. every 30s).</p>
+  </div>
+  <div class="step">
+    <h3><span class="num">8</span> 📞 A phone call</h3>
+    <p>If it stays unacknowledged for your <b>Call me</b> delay, your phone actually rings with a spoken message.</p>
+  </div>
+
+  <div class="hdr">What turns it all off</div>
+
+  <div class="step off">
+    <h3><span class="num">✓</span> Only an <b>active</b> acknowledgment</h3>
+    <p>Repeats and the call stop — and the badge clears — the moment you do one of these:</p>
+    <ul>
+      <li><b>Open</b> the session (tap into it)</li>
+      <li><b>Reply</b> to it (send a message)</li>
+      <li><b>Tap the alert</b> (which opens it)</li>
+    </ul>
+    <p style="margin-top:8px;color:var(--muted)">Just having the session <i>on screen</i> does <b>not</b> count — a screen being open doesn't mean you saw it. It keeps nudging until you actually act.</p>
+  </div>
+</div>
+</body>
+</html>

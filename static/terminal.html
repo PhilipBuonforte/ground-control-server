@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Ground Control · Terminal</title>
+<link rel="stylesheet" href="/xterm.min.css">
+<style>
+  :root { --clay:#D97757; --bg:#faf9f5; --panel:#f0eee9; --ink:#1f1c18; --muted:#8a8378; --line:#e0dccf; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); overflow:hidden; }
+  #bar {
+    height:44px; display:flex; align-items:center; gap:10px;
+    padding:0 12px; padding-top:env(safe-area-inset-top);
+    background:var(--panel); color:var(--ink);
+    font:600 14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    border-bottom:1px solid var(--line);
+  }
+  #dot { width:10px; height:10px; border-radius:50%; background:var(--muted); flex:0 0 auto; }
+  #dot.working { background:var(--clay); animation:pulse 1s ease-in-out infinite; }
+  #dot.idle { background:#3f9d5a; }
+  @keyframes pulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(.5);opacity:.4} }
+  #status { color:var(--muted); font-weight:500; font-size:12.5px; }
+  #wrap { position:absolute; top:calc(44px + env(safe-area-inset-top)); left:0; right:0; bottom:var(--inbar,0px); }
+  #term { width:100%; height:100%; padding:8px 6px; }
+  .xterm { height:100%; }
+  /* mobile input bar — reliable keyboard on phones (xterm's own kbd is flaky on iOS) */
+  #inbar { position:absolute; left:0; right:0; bottom:0; display:none;
+    flex-direction:column; gap:6px; padding:8px 8px calc(8px + env(safe-area-inset-bottom));
+    background:var(--panel); border-top:1px solid var(--line); }
+  #keys { display:flex; gap:6px; overflow-x:auto; }
+  #keys button { flex:0 0 auto; background:#e7e2d8; color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:7px 11px; font:600 13px ui-monospace,Menlo,monospace; }
+  #keys button:active { background:var(--clay); color:#fff; }
+  #inrow { display:flex; gap:8px; align-items:center; }
+  #msg { flex:1; background:#fff; color:var(--ink); border:1px solid var(--line); border-radius:10px;
+    padding:11px 12px; font:15px -apple-system,BlinkMacSystemFont,sans-serif; }
+  #send { flex:0 0 auto; background:var(--clay); color:#fff; border:none; border-radius:10px;
+    width:44px; height:44px; font-size:18px; font-weight:800; }
+  body.mobile #inbar { display:flex; }
+  body.mobile { --inbar:118px; }
+  /* On phones the native app already shows its own title+Done bar, so the
+     in-page bar is redundant double-chrome — hide it and reclaim the space. */
+  body.mobile #bar { display:none; }
+  body.mobile #wrap { top:0; }
+  body.mobile #term { padding:4px 2px; transform:translateZ(0); }   /* fill width; own compositing layer = steadier DOM repaint */
+  /* Momentum + smooth touch scrolling on the xterm viewport. */
+  .xterm-viewport { -webkit-overflow-scrolling:touch; }
+  #keys button.armed { background:var(--clay); color:#fff; }
+  /* Floating "jump to bottom" button — appears only when scrolled up, so after
+     scrolling way back through history you can snap to the live prompt in one tap. */
+  #tobottom {
+    position:absolute; right:16px; z-index:20;
+    bottom:calc(var(--inbar,0px) + 18px + env(safe-area-inset-bottom));
+    width:42px; height:42px; border-radius:50%;
+    background:var(--clay); color:#fff; border:none;
+    box-shadow:0 3px 10px rgba(0,0,0,.28);
+    font-size:20px; font-weight:800; line-height:1;
+    display:none; align-items:center; justify-content:center;
+    opacity:.94; cursor:pointer; -webkit-tap-highlight-color:transparent;
+  }
+  #tobottom.show { display:flex; }
+  #tobottom:active { transform:scale(.9); }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <div id="dot"></div>
+    <div id="name">Terminal</div>
+    <div id="status" style="margin-left:auto">connecting…</div>
+  </div>
+  <div id="wrap"><div id="term"></div></div>
+  <button id="tobottom" aria-label="Scroll to bottom" title="Jump to latest">↓</button>
+
+  <div id="inbar">
+    <div id="keys">
+      <button data-k="esc">esc</button>
+      <button data-k="ctrl">ctrl</button>
+      <button data-k="tab">tab</button>
+      <button data-k="up">↑</button>
+      <button data-k="down">↓</button>
+      <button data-k="left">←</button>
+      <button data-k="right">→</button>
+      <button data-k="tilde">~</button>
+      <button data-k="pipe">|</button>
+      <button data-k="slash">/</button>
+      <button data-k="enter">⏎</button>
+      <button data-k="ctrlc">^C</button>
+    </div>
+    <div id="inrow">
+      <input id="msg" type="text" placeholder="Type a message…" autocapitalize="off" autocorrect="off" enterkeyhint="send">
+      <button id="send">↑</button>
+    </div>
+  </div>
+
+<script src="/xterm.min.js"></script>
+<script src="/xterm-addon-fit.min.js"></script>
+<script src="/xterm-addon-webgl.min.js"></script>
+<script src="/xterm-addon-canvas.min.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const NAME = params.get("name") || "";
+document.getElementById("name").textContent = NAME ? NAME.slice(0,8) : "no session";
+// Detect phones up front — the renderer choice depends on it (WebGL flickers in
+// a WKWebView, so phones must use Canvas from the start, not as a fallback).
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || window.matchMedia("(pointer:coarse)").matches || params.get("mobile") === "1";
+
+// Base font size, and an optional `fontSize` query param so the host app can
+// launch the terminal already zoomed to match its ⌘+/⌘−/⌘0 text scale. The
+// live setter below lets the app change it without a reload.
+const BASE_FS = isMobile ? 12 : 13;
+const _qsFs = parseFloat(params.get("fontSize"));
+const START_FS = (_qsFs && _qsFs >= 8 && _qsFs <= 40) ? _qsFs : BASE_FS;
+
+const term = new Terminal({
+  fontFamily: 'ui-monospace, "SF Mono", Menlo, Monaco, monospace',
+  // Phones: start at 12px (set BEFORE open so the canvas atlas isn't rebuilt
+  // afterwards — that rebuild is a visible flash) and no cursor blink (each
+  // blink is a canvas repaint → residual flicker in a WKWebView).
+  fontSize: START_FS, lineHeight: 1.15, cursorBlink: !isMobile, scrollback: 5000,
+  theme: {
+    background: '#faf9f5', foreground: '#1f1c18', cursor: '#D97757',
+    selectionBackground: 'rgba(217,119,87,0.22)',
+    // Palette tuned for a LIGHT background — 'white' maps to dark ink so
+    // prominent (bright-white) TUI text stays readable on paper.
+    black:'#2b2620', red:'#c0392b', green:'#3f8a3a', yellow:'#b0790f',
+    blue:'#2f6bb0', magenta:'#9146c9', cyan:'#227f7f', white:'#3a352d',
+    brightBlack:'#9b9384', brightRed:'#d0503f', brightGreen:'#4e9a45',
+    brightYellow:'#c08a1a', brightBlue:'#3f7bc0', brightMagenta:'#a95fd0',
+    brightCyan:'#2f9a9a', brightWhite:'#1b1815'
+  }
+});
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open(document.getElementById("term"));
+// NOTE: focus handling differs by platform — on mobile we must NOT focus the
+// terminal (see below), so term.focus() is deferred into the desktop-only path.
+fit.fit();
+if (!isMobile) term.focus();   // mobile focuses the #msg input bar, never the terminal (avoids keyboard-flap loop)
+
+// ---- "jump to bottom" floating button ----
+// Shows only when the viewport is scrolled up off the live prompt. Scrolling back
+// down manually through a long history is slow; one tap snaps to the latest.
+const toBottomBtn = document.getElementById("tobottom");
+function updateToBottom() {
+  try {
+    const b = term.buffer.active;
+    const atBottom = b.viewportY >= b.baseY - 1;   // baseY = topline of the last screen
+    toBottomBtn.classList.toggle("show", !atBottom);
+  } catch (e) {}
+}
+term.onScroll(updateToBottom);
+toBottomBtn.addEventListener("click", (e) => {
+  e.preventDefault();
+  term.scrollToBottom();
+  updateToBottom();
+});
+
+// Live font-size zoom, driven by the host app's ⌘+/⌘−/⌘0 (evaluateJavaScript).
+// A smaller/bigger font changes how many rows/cols fit, so we must NOT just refit
+// xterm locally — we have to tell the PTY the new size (SIGWINCH) or Claude's TUI
+// keeps drawing at the old height and its input box floats mid-screen instead of
+// staying pinned to the bottom, exactly like a real terminal. forceFit() refits
+// AND sends the resize (forceFit is hoisted; it's defined further down).
+window.gcSetFontSize = function(px) {
+  px = Math.max(8, Math.min(40, +px || BASE_FS));
+  if (px === term.options.fontSize) return;
+  term.options.fontSize = px;
+  try {
+    forceFit();
+    // Reflowing at a new font size can leave the viewport scrolled up, so the
+    // input line sits off-screen. Snap to the bottom (where the prompt lives) so
+    // the input box stays in view — like a real terminal. The TUI also repaints
+    // after SIGWINCH, so do it again on the next frame once that lands.
+    term.scrollToBottom();
+    requestAnimationFrame(() => { try { term.scrollToBottom(); } catch (e) {} });
+  } catch (e) {}
+};
+
+// GPU renderer — the DOM renderer (xterm's default) is what makes scrolling
+// janky, especially inside a WKWebView with a constantly-repainting TUI.
+// Try WebGL first (fastest); if its context is lost (can happen when the
+// native webview backgrounds) fall back to the Canvas renderer, which is
+// robust in embedded webviews. Either beats DOM by a wide margin.
+function useCanvas() {
+  try { term.loadAddon(new CanvasAddon.CanvasAddon()); } catch (e) {}
+}
+// Phones (WKWebView): the WebGL renderer flickers on every TUI repaint and loses
+// its GL context when the app backgrounds — the "flickering / freaking out" on
+// mobile. Canvas is rock-solid in embedded webviews, so phones use it directly.
+// Desktop keeps WebGL (fastest) with a Canvas fallback on context loss.
+if (isMobile) {
+  // Phones: use xterm's DEFAULT DOM renderer — load no GPU addon at all. WebGL
+  // flickers in a WKWebView and Canvas still flickers when Claude's spinner
+  // repaints; the DOM renderer is the only one with ZERO flicker there. For an
+  // append-heavy TUI its scroll cost is negligible. (Flip back to useCanvas()
+  // if scrolling ever feels janky — see terminal-brain memory.)
+} else {
+  try {
+    const webgl = new WebglAddon.WebglAddon();
+    webgl.onContextLoss(() => { try { webgl.dispose(); } catch (e) {} useCanvas(); });
+    term.loadAddon(webgl);
+  } catch (e) {
+    useCanvas();
+  }
+}
+
+const statusEl = document.getElementById("status");
+const dotEl = document.getElementById("dot");
+let ws = null, reconnectT = null;
+
+function wsURL() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}/ws/term/${encodeURIComponent(NAME)}?cols=${term.cols}&rows=${term.rows}`;
+}
+
+async function ensure() {
+  try { await fetch(`/api/ez/${encodeURIComponent(NAME)}/ensure`, {method:"POST"}); }
+  catch(e){}
+}
+
+function connect() {
+  ws = new WebSocket(wsURL());
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { connState = "live"; renderStatus(); lastCols = term.cols; lastRows = term.rows; sendResize(); };
+  // Coalesce incoming bytes into a single write per animation frame. A busy
+  // TUI fires many tiny WS messages; one write/frame lets xterm batch the
+  // render instead of relayout-thrashing on every chunk.
+  let pendingChunks = [], flushScheduled = false;
+  function flushChunks() {
+    flushScheduled = false;
+    if (!pendingChunks.length) return;
+    const batch = pendingChunks; pendingChunks = [];
+    for (const c of batch) term.write(c);
+    updateToBottom();   // new output grew the buffer — refresh the jump button state
+  }
+  ws.onmessage = (ev) => {
+    pendingChunks.push(typeof ev.data === "string" ? ev.data : new Uint8Array(ev.data));
+    if (!flushScheduled) { flushScheduled = true; requestAnimationFrame(flushChunks); }
+  };
+  ws.onclose = () => {
+    connState = "reconnecting…"; workingNow = false; dotEl.className = ""; renderStatus();
+    clearTimeout(reconnectT); reconnectT = setTimeout(() => { ensure().then(connect); }, 1200);
+  };
+  ws.onerror = () => { try { ws.close(); } catch(e){} };
+}
+
+term.onData(d => { if (ws && ws.readyState === 1) ws.send(d); });
+
+let lastCols = 0, lastRows = 0;
+function sendResize() {
+  if (ws && ws.readyState === 1)
+    ws.send(JSON.stringify({t:"resize", cols:term.cols, rows:term.rows}));
+}
+function vpWidth() { return window.visualViewport ? window.visualViewport.width : window.innerWidth; }
+let lastVPWidth = vpWidth();
+// Resize policy. iOS fires visualViewport 'resize' constantly — and critically it
+// fires on HEIGHT-only changes (keyboard, URL bar, safe-area, momentum scroll)
+// where the terminal WIDTH never changed. Refitting/PTY-resizing on those is what
+// made the rows flap 48↔26 and flicker "out of control" (every PTY resize also
+// cancels Claude's in-flight synchronized-output frame → partial redraw). So on
+// MOBILE we react to WIDTH changes only (orientation); height changes are ignored
+// entirely — the PTY size stays rock-stable. Desktop keeps full fit-on-resize.
+let fitT = null;
+function doFit() {
+  clearTimeout(fitT);
+  fitT = setTimeout(() => {
+    try {
+      if (isMobile) {
+        const w = vpWidth();
+        if (Math.abs(w - lastVPWidth) < 2) return;  // height-only change → ignore
+        lastVPWidth = w;
+      }
+      fit.fit();
+      if (term.cols !== lastCols || term.rows !== lastRows) {
+        lastCols = term.cols; lastRows = term.rows;
+        sendResize();
+      }
+    } catch (e) {}
+  }, 80);
+}
+window.addEventListener("resize", doFit);
+window.visualViewport && window.visualViewport.addEventListener("resize", doFit);
+// Unconditional fit — for deliberate moments (after the mobile layout is applied,
+// after orientation) where we DO want to recompute even if width didn't change.
+function forceFit() {
+  try {
+    fit.fit();
+    lastVPWidth = vpWidth();
+    if (term.cols !== lastCols || term.rows !== lastRows) {
+      lastCols = term.cols; lastRows = term.rows;
+      sendResize();
+    }
+  } catch (e) {}
+}
+// Desktop only: tap the terminal to focus it. On mobile this would pop the iOS
+// keyboard via xterm's hidden textarea and start a focus/resize flap — mobile
+// types through the #msg bar instead, so tapping the terminal does nothing.
+if (!isMobile) document.getElementById("wrap").addEventListener("click", () => term.focus());
+
+// Working status — poll the SAME server source as the chat banner + side dot so all
+// three stay in sync, and show Claude's own status label ("Brewed · 1 shell still
+// running") in the header. One source of truth: the terminal.
+let workingNow = false, lastLabel = null, connState = "connecting…";
+function renderStatus() {
+  statusEl.textContent = workingNow ? (lastLabel || "working") : connState;
+}
+async function pollWork() {
+  try {
+    const d = await (await fetch(`/api/work/${encodeURIComponent(NAME)}`)).json();
+    workingNow = !!d.working;
+    if (workingNow) { if (d.label) lastLabel = d.label; } else { lastLabel = null; }
+    dotEl.className = workingNow ? "working" : "idle";
+    renderStatus();
+  } catch (e) {}
+}
+setInterval(pollWork, 1000);
+pollWork();
+
+// ---- input helpers (keystrokes into the real PTY) ----
+function sendRaw(s) { if (ws && ws.readyState === 1) ws.send(s); }
+const KEY = {
+  esc:'\x1b', enter:'\r', tab:'\t', ctrlc:'\x03',
+  up:'\x1b[A', down:'\x1b[B', left:'\x1b[D', right:'\x1b[C',
+  tilde:'~', pipe:'|', slash:'/'
+};
+
+// Mobile: xterm's own keyboard is unreliable on iOS, so show a real input bar.
+if (isMobile) {
+  document.body.classList.add("mobile");
+  // Font size is already 12 from construction (set pre-open to avoid an atlas
+  // rebuild flash); force one fit now that the mobile layout/CSS is applied
+  // (this is a real width/layout change, so bypass the width-gate).
+  forceFit();
+
+  // Sticky ctrl: tap `ctrl`, then the next letter you type is sent as a
+  // control code (ctrl-c, ctrl-r, …). Matches how the EZ terminal behaves.
+  let ctrlArmed = false;
+  const ctrlBtn = document.querySelector('#keys button[data-k="ctrl"]');
+  function setArmed(on) { ctrlArmed = on; if (ctrlBtn) ctrlBtn.classList.toggle("armed", on); }
+  function ctrlCode(ch) {
+    const c = ch.toLowerCase().charCodeAt(0);
+    return (c >= 97 && c <= 122) ? String.fromCharCode(c - 96) : ch;
+  }
+
+  document.querySelectorAll("#keys button").forEach(b => {
+    b.addEventListener("click", (e) => {
+      e.preventDefault();
+      if (b.dataset.k === "ctrl") { setArmed(!ctrlArmed); return; }
+      if (ctrlArmed) setArmed(false);   // any other key cancels a pending ctrl
+      sendRaw(KEY[b.dataset.k] || "");
+    });
+  });
+  const msg = document.getElementById("msg");
+  // When ctrl is armed, the first character typed becomes ctrl+<char>.
+  msg.addEventListener("input", () => {
+    if (ctrlArmed && msg.value.length) {
+      sendRaw(ctrlCode(msg.value[msg.value.length - 1]));
+      msg.value = "";
+      setArmed(false);
+    }
+  });
+  function submitMsg() {
+    const v = msg.value;
+    if (v.length) { sendRaw(v + "\r"); msg.value = ""; }
+    else { sendRaw("\r"); }
+  }
+  document.getElementById("send").addEventListener("click", (e) => { e.preventDefault(); submitMsg(); });
+  msg.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitMsg(); } });
+  // One more fit after layout settles (fonts/CSS applied), then we're stable —
+  // subsequent height-only viewport changes are ignored by doFit's width-gate.
+  setTimeout(forceFit, 300);
+}
+
+ensure().then(connect);
+</script>
+</body>
+</html>

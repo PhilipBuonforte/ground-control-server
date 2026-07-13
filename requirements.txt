@@ -1,9 +1,5 @@
 fastapi
-uvicorn
-pydantic
-pywebpush
-py-vapid
-PyJWT
-cryptography
+uvicorn[standard]
 httpx[http2]
+pyte
 Pillow
