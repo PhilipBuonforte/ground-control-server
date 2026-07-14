@@ -334,29 +334,103 @@ def _quick_raw(name: str, budget: float = 0.4, cap: int = 160_000) -> Optional[b
     return buf[-cap:] if buf else None
 
 
-def _render_lines(name: str, cols: int = 220, rows: int = 60) -> Optional[list]:
-    """Render the live stream through pyte into the actual visible screen lines
-    (rstripped). Rendered LARGER than any real client so absolute cursor positions
-    (which reference the real PTY size, always ≤ these) land on-screen and the footer
-    is never clipped or wrapped. None if pyte is missing or the session is unreachable."""
+# Begin-Synchronized-Update. Claude's TUI wraps each repaint in BSU … ESU and redraws
+# the whole prompt region inside that block — so the last BSU block IS the current screen.
+# Only used as a fallback when the true PTY geometry can't be determined.
+_BSU = b"\x1b[?2026h"
+
+_size_cache: dict = {}      # name -> (ts, (cols, rows))
+_SIZE_TTL = 15.0
+
+
+def _pty_size(name: str):
+    """The session's TRUE PTY geometry (cols, rows), or None.
+
+    pyte MUST render at this exact size. A TUI positions text with ABSOLUTE cursor moves
+    that reference the real terminal size, so rendering into a differently-shaped grid
+    desyncs the replay and progressively corrupts it. Measured on the /model wizard: at
+    220x60 the menu came out as "Opusl4.8 withE1Micontext" with only 3 of 5 options; at the
+    real 80x24 it renders perfectly. Widening the grid (the old "render bigger so nothing
+    clips" idea) is exactly wrong — it guarantees the mismatch.
+
+    Read from the OS, not the wire: find this session's daemon, then the child (claude) on
+    its PTY slave, and ioctl the tty. Works for daemons of ANY vintage — no protocol change,
+    so sessions already running get the fix too.
+    """
+    hit = _size_cache.get(name)
+    if hit and time.time() - hit[0] < _SIZE_TTL:
+        return hit[1]
+    size = None
+    try:
+        import fcntl as _fcntl
+        import termios as _termios
+
+        out = subprocess.run(["ps", "-Ao", "pid,ppid,tty,command"],
+                             capture_output=True, text=True, timeout=3).stdout
+        dpid = None
+        for line in out.splitlines():
+            if "gc_ez_engine" in line and name in line:
+                dpid = line.split()[0]
+                break
+        if dpid:
+            for line in out.splitlines():
+                p = line.split(None, 3)
+                if len(p) >= 3 and p[1] == dpid and p[2].startswith("ttys"):
+                    fd = os.open("/dev/" + p[2], os.O_RDONLY | os.O_NONBLOCK)
+                    try:
+                        rows, cols, _, _ = struct.unpack(
+                            "HHHH", _fcntl.ioctl(fd, _termios.TIOCGWINSZ, b"\0" * 8))
+                    finally:
+                        os.close(fd)
+                    if cols > 0 and rows > 0:
+                        size = (cols, rows)
+                    break
+    except Exception:  # noqa: BLE001
+        size = None
+    _size_cache[name] = (time.time(), size)
+    return size
+
+
+def _render_frame(raw: bytes, cols: int, rows: int) -> Optional[list]:
+    scr = _pyte.Screen(cols, rows)
+    stream = _pyte.ByteStream(scr)
+    try:
+        stream.feed(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    return [ln.rstrip() for ln in scr.display]
+
+
+def _render_lines(name: str, cols: int = 0, rows: int = 0) -> Optional[list]:
+    """Render the terminal's CURRENT screen (rstripped lines) via pyte.
+
+    RENDER AT THE TRUE PTY GEOMETRY (see _pty_size). That single fact is what makes the
+    replay faithful — it's how a real client (xterm.js/SwiftTerm) gets a correct screen from
+    the same bytes. Feed the recent tail; successive full repaints converge onto the current
+    screen, exactly as they do in the user's terminal window.
+
+    Fallback when the size can't be read: render from the last synchronized-update frame
+    (Claude wraps each repaint in BSU…ESU, so that block is a coherent screen) on a wide
+    grid. Less faithful — cells the TUI didn't rewrite come out blank — but far better than
+    replaying history into a mismatched grid, which corrupts the text outright.
+    """
     if _pyte is None:
         return None
     raw = _quick_raw(name)
     if not raw:
         return None
-    # Feed pyte only the recent TAIL, not the whole (up to 160KB) buffer: the footer
-    # we read lives in the last full repaint, which is far under 48KB. Rendering the
-    # whole buffer cost ~49ms of GIL-holding CPU per call and, across the warmer's
-    # sessions, starved the live terminal WebSocket (glitchy/slow switching). A partial
-    # leading escape sequence from the cut is harmless — pyte ignores it and the later
-    # absolutely-positioned repaint overwrites everything that matters.
-    scr = _pyte.Screen(cols, rows)
-    stream = _pyte.ByteStream(scr)
-    try:
-        stream.feed(raw[-48_000:])
-    except Exception:
-        return None
-    return [ln.rstrip() for ln in scr.display]
+    size = _pty_size(name) if not (cols and rows) else (cols, rows)
+    if size:
+        return _render_frame(raw[-64_000:], size[0], size[1])
+    starts, i = [], raw.rfind(_BSU)
+    while i != -1 and len(starts) < 6:
+        starts.append(i)
+        i = raw.rfind(_BSU, 0, i)
+    for s in starts:
+        lines = _render_frame(raw[s:], 220, 60)
+        if lines and sum(1 for ln in lines if ln.strip()) >= 3:
+            return lines
+    return _render_frame(raw[-48_000:], 220, 60)
 
 
 _SPIN_GLYPHS_SET = "✻✽✶✳✢✷✵✴✸✹✺✼◐◑◒◓"
@@ -581,14 +655,22 @@ _label_cache: dict = {}   # name -> (ts, label)
 _LABEL_TTL = 1.5
 
 
-def work_label(name: str) -> Optional[str]:
-    """Claude's current status word for the banner, from a throttled render. None if idle."""
+def work_label(name: str, render: bool = True) -> Optional[str]:
+    """Claude's current status word for the banner. None if idle.
+
+    render=True (the warmer): actually render when the cache is stale — this is the ONLY
+    place a render should happen, on the background thread.
+    render=False (request path, via work_status): pure CACHE read — never do a 0.4s socket
+    render inline. Rendering on the request made /api/work ~545ms/poll and fought the live
+    terminal for the daemon socket. A slightly stale label is invisible; a stalled poll is not."""
     if not is_busy(name):
         return None
     hit = _label_cache.get(name)
     now = time.time()
     if hit and now - hit[0] < _LABEL_TTL:
         return hit[1]
+    if not render:
+        return hit[1] if hit else None      # stale-but-cheap; warmer refreshes it
     lines = _render_lines(name)
     label = _label_from_lines(lines) if lines else None
     _label_cache[name] = (now, label)
@@ -645,6 +727,14 @@ def _strip_box(line: str) -> str:
     return line.strip(_BOX_CHARS)
 
 
+def _split_label(rest: str):
+    """Split a menu row's text into (label, description). Claude column-aligns the two
+    with a run of spaces — '1. Fable        Fable 5 · Most capable…' — so a 2+ space gap
+    is the separator. Without this the app showed one long run-on line per option."""
+    parts = _re.split(r"\s{2,}", rest, maxsplit=1)
+    return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
+
+
 def terminal_question(name: str):
     """Read the prompt Claude is BLOCKED on straight off the rendered screen, as
     {question, options[]} — so the app can offer TAPPABLE answers for ANY interactive
@@ -664,36 +754,56 @@ def terminal_question(name: str):
     lines = _render_lines(name)
     if not lines:
         return None
-    # Claude draws these menus INSIDE a box, so every row arrives as "│ ❯ 1. Yes … │".
+    # Claude draws these menus INSIDE a box, so rows arrive as "│ ❯ 1. Yes … │".
     # Strip the border glyphs before matching — otherwise nothing matches and we silently
     # fall back to the dead-end "Answer in Terminal" button.
-    tail = [_strip_box(l) for l in lines[-30:]]
+    #
+    # Scan the WHOLE rendered screen, not a bottom slice. We used to look only at the last
+    # 30 rows, but pyte renders a 60-row grid and the TUI draws from the TOP — the /model
+    # wizard's options land around rows 20-27, so the tail window saw only blank rows and
+    # every /model, /effort, etc. prompt fell through to "answer in the terminal".
+    rows = [_strip_box(l) for l in lines]
     # Collect contiguous 1,2,3… runs. CRITICAL: the LAST run wins. Claude's own message
     # text often contains a numbered list ("my plan: 1. Foo  2. Bar") that sits on screen
     # ABOVE the real menu — locking onto the first run would show those lines as the
     # options while the typed digit answers the REAL menu below: a label/action mismatch,
     # the worst possible failure (silently answers the wrong thing). The prompt's menu is
     # always the bottom-most run, so every fresh "1." starts a new candidate run.
-    opts, first_idx = [], None
-    for i, line in enumerate(tail):
+    opts, first_idx, last_row = [], None, None
+    for i, line in enumerate(rows):
         m = _OPTION_RE.match(line)
-        if not m:
+        if m:
+            n, rest = int(m.group(1)), m.group(2).strip()
+            if n == 1:                    # a new "1." = a new candidate menu — reset
+                opts, first_idx = [], i
+            elif n != len(opts) + 1:      # non-contiguous → not part of the current run
+                continue
+            label, desc = _split_label(rest)
+            opts.append({"label": label, "description": desc})
+            last_row = i
             continue
-        n, label = int(m.group(1)), m.group(2).strip()
-        if n == 1:                    # a new "1." = a new candidate menu — reset
-            opts, first_idx = [], i
-        elif n != len(opts) + 1:      # non-contiguous → not part of the current run
-            continue
-        opts.append({"label": label, "description": ""})
+        # A wrapped continuation of the option directly above ("… Best for everyday," /
+        # "complex tasks") — fold it into that option's description. A blank row always
+        # separates the menu from the footer below, so this can't swallow the footer.
+        if opts and last_row == i - 1 and line.strip():
+            opts[-1]["description"] = (opts[-1]["description"] + " " + line.strip()).strip()
+            last_row = i
     if len(opts) < 2:                 # not a menu we can answer by number
         return None
-    # The question = the nearest meaningful line above the first option.
+    # The question/title = the TOP line of the contiguous text block above the options
+    # (skip the blank gap first). Taking the nearest line gave the wrapped tail of the
+    # blurb ("other/previous model names, specify with --model.") instead of "Select model".
+    # A separator/border row strips to "" so the walk stops there naturally.
     question = ""
-    for line in reversed(tail[:first_idx]):
-        t = line.strip()
-        if len(t) > 3 and not _OPTION_RE.match(t):
-            question = t
-            break
+    j = (first_idx or 0) - 1
+    while j >= 0 and not rows[j].strip():
+        j -= 1
+    block = []
+    while j >= 0 and rows[j].strip():
+        block.append(rows[j].strip())
+        j -= 1
+    if block:
+        question = block[-1]
     return {"header": "", "question": question, "multiSelect": False, "options": opts}
 
 
@@ -733,7 +843,7 @@ def work_status(name: str):
     render. ONE source used by chat banner, terminal banner, and side dot."""
     if not is_busy(name):
         return (False, None)
-    return (True, work_label(name))
+    return (True, work_label(name, render=False))   # cache-only on the request path
 
 
 def refresh_working(names: list) -> None:

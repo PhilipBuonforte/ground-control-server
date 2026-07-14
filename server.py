@@ -1258,6 +1258,21 @@ async def ws_term(ws: WebSocket, name: str, cols: int = 80, rows: int = 40):
             pass
 
     out_task = asyncio.create_task(pump_out())
+    # Engagement ack, THROTTLED and NON-BLOCKING. clear_unread reads+writes a JSON file
+    # under a lock; calling it inline on the async loop for EVERY keystroke did dozens of
+    # blocking disk reads/sec while typing, stalling the whole event loop (the app "locked
+    # up" mid-session). Now: at most once per 2s per connection, and the file work runs in
+    # a thread so it never blocks the loop. First keystroke still clears the alert promptly.
+    last_ack = 0.0
+
+    async def _ack_engagement():
+        nonlocal last_ack
+        now = time.monotonic()
+        if now - last_ack < 2.0:
+            return
+        last_ack = now
+        sid = sid_for_ez(name) or name
+        await loop.run_in_executor(None, lambda: clear_unread(sid, "ws-terminal-input"))
     try:
         while True:
             msg = await ws.receive()
@@ -1266,10 +1281,9 @@ async def ws_term(ws: WebSocket, name: str, cols: int = 80, rows: int = 40):
             b = msg.get("bytes")
             t = msg.get("text")
             if b is not None:
-                # ANY keystroke into the terminal = Phil is engaging this session → acknowledge
-                # it (clears the alert the moment he types in the terminal composer, not only on
-                # Enter). Enter additionally arms it to alert him about the result.
-                clear_unread(sid_for_ez(name) or name, reason="ws-terminal-input")
+                # ANY keystroke = Phil is engaging this session → acknowledge it (clears the
+                # alert the moment he types in the terminal, not only on Enter).
+                await _ack_engagement()
                 if b'\r' in b or b'\n' in b:
                     mark_expecting(sid_for_ez(name) or name)
                 await loop.sock_sendall(ezsock, b)
@@ -1288,7 +1302,7 @@ async def ws_term(ws: WebSocket, name: str, cols: int = 80, rows: int = 40):
                             continue
                     except Exception:  # noqa: BLE001
                         pass
-                clear_unread(sid_for_ez(name) or name, reason="ws-terminal-input")
+                await _ack_engagement()
                 if "\r" in t or "\n" in t:
                     mark_expecting(sid_for_ez(name) or name)
                 await loop.sock_sendall(ezsock, t.encode())
@@ -3323,10 +3337,21 @@ def _terminal_work_warmer():
     without blocking any request. Terminal is the brain."""
     while True:
         try:
-            gc_ez.refresh_working(gc_ez.list_sessions())
+            names = gc_ez.list_sessions()
+            gc_ez.refresh_working(names)
+            # Pre-render the status LABEL here, off the request path. work_label caches
+            # the render; doing it in this background thread means /api/work is a pure
+            # cache read (~5ms) instead of a 0.4s socket read against the same EZ daemon
+            # that streams the live terminal — that inline render made /api/work ~545ms
+            # every poll and contended with typing.
+            for n in names:
+                try:
+                    gc_ez.work_label(n)
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as e:  # noqa: BLE001
             print(f"[work-warm] {e}", flush=True)
-        time.sleep(0.6)
+        time.sleep(0.8)
 
 
 @app.get("/api/mac-alerts")
