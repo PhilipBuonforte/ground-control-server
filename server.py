@@ -1661,8 +1661,6 @@ def list_sessions():
             return None
         with _jobs_lock:
             job = _jobs.get(sid, {})
-        _bw = working_by_ez(ezmap.get(sid, sid))   # computed ONCE; feeds both busy + busyTs
-        _now = time.time()
         return {
             "id": sid,
             "ezName": ezmap.get(sid, sid),
@@ -1674,15 +1672,12 @@ def list_sessions():
             "cwd": r.get("cwd") or "",
             "mtime": mtime,
             "live": sid in live,
-            # ONE source of truth: the SAME computation /api/work uses, keyed by the
-            # SAME EZ handle. The dot and the chat/terminal banner can never disagree.
-            "busy": _bw,
-            # BUSY AS A LEASE, not a sticky flag. `busyTs` = the wall-clock time the server
-            # CONFIRMED this session working (0 when idle). The client shows the spinner only
-            # while that confirmation is fresh, so a stuck spinner is impossible: if updates
-            # stop, the stamp ages out and the spinner decays off on its own. This is the fix
-            # for the recurring phantom spinner — a boolean has no expiry; a timestamp does.
-            "busyTs": _now if _bw else 0.0,
+            # The authoritative instantaneous fact: is this session emitting output right now
+            # (the SAME computation /api/work uses, keyed by the SAME EZ handle, so surfaces
+            # can't disagree). The DECAY that smooths gaps + survives dropped polls lives on
+            # the CLIENT, timed by the client's OWN clock — never a cross-machine timestamp
+            # comparison (that clock-skew mistake made the spinner vanish on the phone).
+            "busy": working_by_ez(ezmap.get(sid, sid)),
             "unread": sid in unreads,
         }
 
