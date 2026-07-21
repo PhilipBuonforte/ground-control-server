@@ -204,8 +204,9 @@ def parse_turns(path: Path):
                                         f"/api/msgimg/{dir_name}/{sid}/{cur['uuid']}/{i}-{j}")
                                     tool_img = True
             if clean or images:
-                if len(clean) > 2500:
-                    clean = clean[:2500] + "\n…[truncated]"
+                # Show the FULL message — no truncation. (The old 2500-char cap made the
+                # chat window print "…[truncated]" on any longer message, which Phil
+                # rightly flagged: real messages shouldn't be cut.)
                 turns.append(
                     {
                         "id": cur["uuid"],
@@ -702,6 +703,120 @@ def usage(days: int = 30):
             "weights": _MODEL_WEIGHT}
 
 
+def _event_cost(e: dict) -> float:
+    """Real $ for one usage event, from _CTX_PRICES[family] = (in, out, cr, cw) per 1M."""
+    p = _CTX_PRICES.get(e.get("model"), _CTX_PRICES["opus"])
+    return (e["in"] * p[0] + e["out"] * p[1] + e["cr"] * p[2] + e["cw"] * p[3]) / 1_000_000.0
+
+
+@app.get("/api/activity")
+def activity(start: float = 0.0, end: float = 0.0):
+    """What's running now + real per-session token/time/$ usage in a [start,end] window.
+    Powers the Usage → Activity tab. Both bounds are epoch seconds; end<=0 means "now".
+    Covers EVERY session on this Mac (bridge-driven, other-project, Silver Lands, etc.) —
+    NOT just app-born ones — by scanning the full transcript index + all live EZ terminals.
+    active_min = distinct 1-minute buckets that emitted an assistant message (real work
+    time, not wall-clock the tab was left open)."""
+    now = time.time()
+    if end <= 0:
+        end = now
+    idx = _transcript_index()          # sid -> transcript path, ALL projects
+    ezmap = _load_ez_names()           # sid -> clean EZ handle ("LX Website")
+    recs_by_sid = {}                   # sid -> desktop record (for the nicest title/cwd)
+    for r in _desktop_records().values():
+        s = r.get("cliSessionId")
+        if s:
+            recs_by_sid[s] = r
+
+    def _label(sid: str) -> tuple:
+        """(title, project). Title prefers a real name; for bridge/other sessions the
+        first user message is /requests spam, so fall back to the PROJECT name, never
+        that. cwd is resolved once here."""
+        r = recs_by_sid.get(sid)
+        cwd = r.get("cwd") if r else None
+        if not cwd:
+            p = idx.get(sid)
+            if p:
+                _, _, cwd = session_meta(p)
+                if not cwd:  # decode the encoded project-dir as a last resort
+                    cwd = p.parent.name.replace("-", "/")
+        project = Path(cwd).name if cwd else ""
+        if r and r.get("title"):
+            title = r["title"][:60]
+        else:
+            nm = ezmap.get(sid)
+            title = (nm[:60] if (nm and not _UUIDISH.match(nm)) else (project or sid[:8]))
+        return title, project
+
+    # ---- Active now: EVERY live EZ terminal that's genuinely working ----
+    active = []
+    for name in gc_ez.list_sessions():
+        if not working_by_ez(name):
+            continue
+        sid = sid_for_ez(name) or name
+        path = idx.get(sid)
+        prog = _work_progress(path) if path else None
+        title, project = _label(sid)
+        active.append({
+            "id": sid,
+            "title": name if not _UUIDISH.match(name) else title,
+            "project": project,
+            "elapsedSec": (prog or {}).get("seconds", 0),
+            "turnTokens": (prog or {}).get("tokens", 0),
+        })
+    active.sort(key=lambda a: -a["elapsedSec"])
+
+    # ---- Usage in window: aggregate real transcript events across ALL sessions ----
+    def _cheap_title(sid: str) -> str:
+        r = recs_by_sid.get(sid)
+        if r and r.get("title"):
+            return r["title"][:60]
+        nm = ezmap.get(sid)
+        return nm[:60] if (nm and not _UUIDISH.match(nm)) else ""
+
+    def _cheap_proj(sid: str) -> str:
+        r = recs_by_sid.get(sid)
+        return Path(r["cwd"]).name if (r and r.get("cwd")) else ""
+
+    agg = {}
+    for sid, path in idx.items():
+        try:
+            evs = _scan_usage_file(path, _cheap_title(sid), _cheap_proj(sid))
+        except OSError:
+            continue
+        for e in evs:
+            if e["ts"] < start or e["ts"] > end:
+                continue
+            a = agg.get(sid)
+            if a is None:
+                a = agg[sid] = {"id": sid, "model": e["model"],
+                                "in": 0, "out": 0, "cr": 0, "cw": 0,
+                                "total": 0, "cost": 0.0, "msgs": 0,
+                                "firstTs": e["ts"], "lastTs": e["ts"], "_min": set()}
+            a["in"] += e["in"]; a["out"] += e["out"]; a["cr"] += e["cr"]; a["cw"] += e["cw"]
+            a["total"] += e["total"]; a["cost"] += _event_cost(e); a["msgs"] += 1
+            a["firstTs"] = min(a["firstTs"], e["ts"]); a["lastTs"] = max(a["lastTs"], e["ts"])
+            a["_min"].add(int(e["ts"] // 60))
+            a["model"] = e["model"]  # last model seen in window
+
+    sessions = []
+    for a in agg.values():
+        a["title"], a["project"] = _label(a["id"])
+        a["activeMin"] = len(a.pop("_min"))
+        a["cost"] = round(a["cost"], 4)
+        sessions.append(a)
+    sessions.sort(key=lambda s: -s["total"])
+
+    totals = {
+        "tokens": sum(s["total"] for s in sessions),
+        "cost": round(sum(s["cost"] for s in sessions), 4),
+        "activeMin": sum(s["activeMin"] for s in sessions),
+        "sessions": len(sessions),
+    }
+    return {"now": now, "range": {"start": start, "end": end},
+            "active": active, "sessions": sessions, "totals": totals}
+
+
 _balance_cache = {"ts": 0.0, "val": None}
 
 
@@ -934,6 +1049,51 @@ def context_all(limit: int = 30):
     return out
 
 
+_MAC_DOWNLOAD_PAGE = """<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Ground Control for Mac</title>
+<style>
+ :root{--clay:#D97757;--paper:#FAF9F5;--ink:#2b2622}
+ *{box-sizing:border-box} body{margin:0;background:var(--paper);color:var(--ink);
+   font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+   display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}
+ .card{max-width:460px;width:100%;background:#fff;border-radius:20px;padding:36px;
+   box-shadow:0 12px 40px rgba(0,0,0,.08);text-align:center}
+ .logo{width:76px;height:76px;border-radius:18px;background:var(--clay);margin:0 auto 18px;
+   display:flex;align-items:center;justify-content:center;font-size:40px;color:#fff}
+ h1{font-size:24px;margin:0 0 6px} p{color:#6b625b;margin:0 0 22px}
+ a.btn{display:inline-block;background:var(--clay);color:#fff;text-decoration:none;
+   font-weight:700;padding:14px 30px;border-radius:12px;font-size:17px}
+ ol{text-align:left;color:#4a423c;font-size:14.5px;margin:26px 0 0;padding-left:20px}
+ ol li{margin:8px 0} code{background:#f0ece6;padding:1px 6px;border-radius:5px;font-size:13px}
+</style></head><body><div class=card>
+ <div class=logo>✳</div>
+ <h1>Ground Control for Mac</h1>
+ <p>The native desktop app. It talks to the server already running on this Mac.</p>
+ <a class=btn href="/download/mac.zip" download>Download for Mac</a>
+ <ol>
+  <li>Unzip the download (it may unzip automatically).</li>
+  <li>Drag <b>Ground Control</b> into your <b>Applications</b> folder.</li>
+  <li>First open: <b>right-click the app → Open → Open</b> (this app isn't from the
+      App Store, so macOS asks once).</li>
+  <li>It connects to <code>http://localhost:8130</code> automatically. Done.</li>
+ </ol>
+</div></body></html>"""
+
+
+@app.get("/download/mac")
+def download_mac_page():
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(_MAC_DOWNLOAD_PAGE)
+
+
+@app.get("/download/mac.zip")
+def download_mac_zip():
+    return FileResponse(STATIC_DIR / "download" / "GroundControl-mac.zip",
+                        media_type="application/zip",
+                        filename="Ground Control.zip")
+
+
 @app.get("/usage")
 def usage_page():
     return FileResponse(STATIC_DIR / "usage.html")
@@ -962,25 +1122,32 @@ def ack_session(sid: str):
 # TERMINAL AS THE BRAIN — EZ (raw-PTY) sessions + xterm bridge
 # ============================================================================
 
+def working_by_ez(name: str) -> bool:
+    """THE one working-state computation, keyed by EZ handle. Every surface — the
+    side-menu dot (list_sessions), the chat/terminal banner (/api/work), Ground Zero
+    — MUST resolve through this so they can NEVER disagree. A live-EZ session with a
+    dead handle reads idle; the canonical sid comes from the same reverse lookup, so
+    there is exactly one branch, one sid, one answer.
+
+    (This killed the class of bug where the dot re-derived busy via build_session's
+    is_working() with legacy `job_running`/mtime args while /api/work took the clean
+    EZ path — same session, two answers, phantom spinner.)"""
+    if not name or not gc_ez.is_alive(name):
+        return False
+    sid = sid_for_ez(name) or name
+    return is_working(sid, True, 0.0, False, None)
+
+
 @app.get("/api/work/{name}")
 def work_state(name: str):
     """Single source of truth for the working status of an EZ terminal, so the chat
     banner, the terminal banner, and the side dot all read the SAME thing. Returns
     {working, label} — label is Claude's own status line ('Brewed · 1 shell still
     running') or null."""
-    if not gc_ez.is_alive(name):
-        return {"working": False, "label": None}
-    # ONE source of truth: route through the EXACT same is_working() the side-menu dot
-    # uses (line ~1356), with the SAME canonical sid, so the dot / chat banner / terminal
-    # banner can never disagree. (Previously this endpoint had its OWN subagent check
-    # under a different key than the dot's → they drifted: dot spinning, banner idle.)
-    sid = sid_for_ez(name) or name
     # Read the WARM CACHE (not a per-poll forced snapshot). Force-reading here snapshotted
     # the viewed session's EZ socket every second, contending with the live terminal WS →
-    # laggy typing on the phone. The cache is kept correct by the 0.6s warmer, and the
-    # detection now catches spinner-only / narrow-terminal working sessions (the earlier
-    # intermittent-idle was a DETECTION miss, not cache staleness — fixed in gc_ez).
-    working = is_working(sid, True, 0.0, False, None)
+    # laggy typing on the phone. The cache is kept correct by the 0.6s warmer.
+    working = working_by_ez(name)
     _, label = gc_ez.work_status(name)
     if working and not label:
         label = "Background agent…"
@@ -1494,6 +1661,8 @@ def list_sessions():
             return None
         with _jobs_lock:
             job = _jobs.get(sid, {})
+        _bw = working_by_ez(ezmap.get(sid, sid))   # computed ONCE; feeds both busy + busyTs
+        _now = time.time()
         return {
             "id": sid,
             "ezName": ezmap.get(sid, sid),
@@ -1505,7 +1674,15 @@ def list_sessions():
             "cwd": r.get("cwd") or "",
             "mtime": mtime,
             "live": sid in live,
-            "busy": is_working(sid, sid in live, mtime, job.get("status") == "running", path),
+            # ONE source of truth: the SAME computation /api/work uses, keyed by the
+            # SAME EZ handle. The dot and the chat/terminal banner can never disagree.
+            "busy": _bw,
+            # BUSY AS A LEASE, not a sticky flag. `busyTs` = the wall-clock time the server
+            # CONFIRMED this session working (0 when idle). The client shows the spinner only
+            # while that confirmation is fresh, so a stuck spinner is impossible: if updates
+            # stop, the stamp ages out and the spinner decays off on its own. This is the fix
+            # for the recurring phantom spinner — a boolean has no expiry; a timestamp does.
+            "busyTs": _now if _bw else 0.0,
             "unread": sid in unreads,
         }
 
@@ -1632,8 +1809,10 @@ def get_session(project_dir: str, session_id: str):
     live = session_id in live_sessions()
     # Actively-viewed session → read the terminal live (snapshot) so busy tracks
     # the terminal instantly, e.g. clears the moment STOP quiets it.
-    busy = is_working(session_id, live, mtime, job.get("status") == "running", path,
-                      terminal_snapshot=True)
+    # NEVER trust the legacy `_jobs` status string (job_running=False) — a stale
+    # "running" that never cleared is exactly the phantom spinner. terminal_snapshot=True
+    # reads the live terminal for the viewed session so busy tracks it instantly.
+    busy = is_working(session_id, live, mtime, False, path, terminal_snapshot=True)
     ez = ez_name_for(session_id)
     # work.label = Claude's own status line, read from the terminal ("Brewed · 1
     # shell still running", "Julienning…") — the single source of truth. Clean timer
@@ -2027,12 +2206,16 @@ def send_message(project_dir: str, session_id: str, body: SendBody):
 
 
 # price per 1M tokens: (input, output, cache_read, cache_write_5m)
-_CTX_PRICES = {"opus": (15.0, 75.0, 1.50, 18.75), "sonnet": (3.0, 15.0, 0.30, 3.75),
-               "haiku": (1.0, 5.0, 0.10, 1.25)}
+# price per 1M tokens: (input, output, cache_read, cache_write_5m) — CURRENT list prices.
+# opus = Opus 4.8 ($5/$25); the old (15,75,...) here was stale Claude-3-Opus and 3x-overcharged.
+_CTX_PRICES = {"fable": (10.0, 50.0, 1.0, 12.5), "opus": (5.0, 25.0, 0.50, 6.25),
+               "sonnet": (3.0, 15.0, 0.30, 3.75), "haiku": (1.0, 5.0, 0.10, 1.25)}
 
 
 def _model_family(model: str) -> str:
     m = (model or "").lower()
+    if "fable" in m:
+        return "fable"
     if "opus" in m:
         return "opus"
     if "haiku" in m:
