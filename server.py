@@ -1109,6 +1109,13 @@ def alert_flow_page():
     return FileResponse(STATIC_DIR / "alert-flow.html")
 
 
+@app.get("/how-it-works")
+def how_it_works_page():
+    """Plain-English explainer of the whole architecture (brain / windows / tunnel).
+    Linked from Settings on both apps, and shareable to anyone."""
+    return FileResponse(STATIC_DIR / "how-it-works.html")
+
+
 @app.post("/api/ack/{sid}")
 def ack_session(sid: str):
     """Explicitly acknowledge a session's alert — clears unread so repeats + the phone

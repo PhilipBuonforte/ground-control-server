@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ground Control, explained in a minute</title>
+<style>
+  :root {
+    --paper:#FAF9F5; --card:#FFFFFF; --ink:#2A2620; --muted:#867D70;
+    --line:#EAE4D8; --line-strong:#DED6C6;
+    --clay:#D0603F; --clay-ink:#B14E30; --clay-wash:#FBEEE7;
+    --teal:#2F7385; --teal-wash:#EAF1F2;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    --maxw:720px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --paper:#171410; --card:#211D17; --ink:#F0EADF; --muted:#9E9483;
+      --line:#30291F; --line-strong:#3C3527;
+      --clay:#E8906F; --clay-ink:#EDA184; --clay-wash:#2A1E17;
+      --teal:#6FB0C0; --teal-wash:#152227;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#171410; --card:#211D17; --ink:#F0EADF; --muted:#9E9483;
+    --line:#30291F; --line-strong:#3C3527;
+    --clay:#E8906F; --clay-ink:#EDA184; --clay-wash:#2A1E17;
+    --teal:#6FB0C0; --teal-wash:#152227;
+  }
+  :root[data-theme="light"]{
+    --paper:#FAF9F5; --card:#FFFFFF; --ink:#2A2620; --muted:#867D70;
+    --line:#EAE4D8; --line-strong:#DED6C6;
+    --clay:#D0603F; --clay-ink:#B14E30; --clay-wash:#FBEEE7;
+    --teal:#2F7385; --teal-wash:#EAF1F2;
+  }
+
+  *{box-sizing:border-box}
+  body{background:var(--paper);color:var(--ink);font-family:var(--sans);
+    line-height:1.62;-webkit-font-smoothing:antialiased;margin:0;
+    padding:clamp(28px,6vw,72px) 20px 96px;}
+  .wrap{max-width:var(--maxw);margin:0 auto}
+
+  .eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--clay-ink);font-weight:700;margin:0 0 14px}
+  h1{font-size:clamp(2rem,5.6vw,3.1rem);line-height:1.05;font-weight:800;
+    letter-spacing:-0.02em;text-wrap:balance;margin:0 0 18px}
+  .lede{font-size:clamp(1.06rem,2.4vw,1.28rem);color:var(--muted);
+    max-width:34ch;margin:0}
+  .lede b{color:var(--ink);font-weight:600}
+
+  h2{font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--muted);font-weight:700;margin:0 0 18px}
+  section{margin-top:clamp(46px,8vw,72px)}
+  p{margin:0 0 14px;max-width:62ch}
+  .accent{color:var(--clay-ink);font-weight:600}
+  .teal{color:var(--teal);font-weight:600}
+  .muted-note{color:var(--muted)}
+
+  /* ---- the diagram ---- */
+  .diagram{display:flex;flex-direction:column;align-items:center;gap:0;
+    text-align:center}
+  .tier-label{font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--muted);font-weight:700;margin-bottom:14px}
+  .windows{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;width:100%}
+  .win{flex:1 1 150px;max-width:200px;background:var(--card);
+    border:1px solid var(--line-strong);border-radius:14px;padding:16px 14px}
+  .win .name{font-weight:650;font-size:15px}
+  .win .tag{font-size:12px;color:var(--muted);margin-top:3px}
+  .win .glyph{display:block;margin:0 auto 10px;color:var(--teal)}
+
+  .stem{width:2px;height:34px;background:var(--line-strong)}
+  .chev{color:var(--line-strong);margin:-6px 0 -2px}
+
+  .tunnel{width:100%;border:1.5px dashed var(--teal);background:var(--teal-wash);
+    border-radius:16px;padding:12px 16px;display:flex;align-items:center;
+    justify-content:center;gap:9px;flex-wrap:wrap}
+  .tunnel .k{font-family:var(--mono);font-size:12.5px;color:var(--teal);
+    font-weight:600;letter-spacing:.02em}
+  .tunnel .d{font-size:13px;color:var(--muted)}
+
+  .brain{width:100%;max-width:340px;background:var(--card);
+    border:2px solid var(--clay);border-radius:18px;padding:20px 20px;
+    box-shadow:0 6px 22px -14px var(--clay)}
+  .brain .role{font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--clay-ink);font-weight:700;margin-bottom:6px}
+  .brain .name{font-size:1.28rem;font-weight:800;letter-spacing:-0.01em}
+  .brain .sub{font-size:13.5px;color:var(--muted);margin-top:6px;line-height:1.5}
+
+  .sessions{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;
+    margin-top:16px}
+  .sess{font-family:var(--mono);font-size:12px;background:var(--paper);
+    border:1px solid var(--line-strong);border-radius:999px;padding:5px 12px;
+    color:var(--ink)}
+  .sess .dot{color:var(--clay);margin-right:5px}
+  .runs-here{font-size:12.5px;color:var(--muted);margin-top:12px;max-width:40ch}
+
+  /* ---- the master callout ---- */
+  .callout{background:var(--card);border:1px solid var(--line-strong);
+    border-left:4px solid var(--clay);border-radius:14px;
+    padding:22px clamp(18px,4vw,28px)}
+  .callout .q{font-weight:700;font-size:1.12rem;margin:0 0 10px;letter-spacing:-0.01em}
+  .callout p:last-child{margin-bottom:0}
+
+  /* ---- glossary ---- */
+  .glo{display:grid;grid-template-columns:120px 1fr;gap:10px 18px;
+    border-top:1px solid var(--line);padding-top:18px}
+  .glo dt{font-family:var(--mono);font-size:13px;color:var(--clay-ink);font-weight:600}
+  .glo dd{margin:0;font-size:14.5px;color:var(--ink)}
+  @media(max-width:440px){.glo{grid-template-columns:1fr;gap:2px 0}
+    .glo dd{margin-bottom:12px;color:var(--muted)}}
+
+  /* ---- one-breath ---- */
+  .breath{background:var(--clay-wash);border-radius:16px;
+    padding:clamp(22px,5vw,32px)}
+  .breath p{font-size:clamp(1.08rem,2.5vw,1.3rem);line-height:1.55;
+    color:var(--ink);max-width:52ch;margin:0}
+  .breath p b{color:var(--clay-ink)}
+
+  footer{margin-top:64px;padding-top:20px;border-top:1px solid var(--line);
+    font-size:12.5px;color:var(--muted);text-align:center}
+  svg{display:block}
+</style>
+</head>
+<body>
+
+
+<div class="wrap">
+
+  <p class="eyebrow">Ground Control · how it actually works</p>
+  <h1>Your Mac does the work. Every screen is just a window into it.</h1>
+  <p class="lede">Run and steer your Claude Code sessions from <b>anywhere</b> — the sessions themselves never leave home.</p>
+
+  <section>
+    <h2>The whole idea, in one picture</h2>
+    <div class="diagram">
+
+      <div class="tier-label">Many windows</div>
+      <div class="windows">
+        <div class="win">
+          <svg class="glyph" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="7" y="2" width="10" height="20" rx="2.5"/><line x1="11" y1="18.5" x2="13" y2="18.5"/></svg>
+          <div class="name">Your phone</div><div class="tag">a window</div>
+        </div>
+        <div class="win">
+          <svg class="glyph" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M2 20h20"/></svg>
+          <div class="name">Your laptop</div><div class="tag">a window</div>
+        </div>
+        <div class="win">
+          <svg class="glyph" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2.5"/><circle cx="12" cy="16" r="1.1" fill="currentColor" stroke="none"/></svg>
+          <div class="name">Mac mini</div><div class="tag">a window</div>
+        </div>
+      </div>
+
+      <div class="stem"></div>
+      <svg class="chev" width="18" height="10" viewBox="0 0 18 10" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 2l7 6 7-6"/></svg>
+
+      <div class="tunnel">
+        <span class="k">TAILSCALE</span>
+        <span class="d">— a private, encrypted tunnel only your devices can enter</span>
+      </div>
+
+      <div class="stem"></div>
+      <svg class="chev" width="18" height="10" viewBox="0 0 18 10" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 2l7 6 7-6"/></svg>
+
+      <div class="tier-label" style="margin-top:6px">One brain</div>
+      <div class="brain">
+        <div class="role">The always-on Mac</div>
+        <div class="name">The brain</div>
+        <div class="sub">Runs a small background program (the server) and holds every session.</div>
+        <div class="sessions">
+          <span class="sess"><span class="dot">●</span>LX: Fleet Analytics</span>
+          <span class="sess"><span class="dot">●</span>LX: Command Center</span>
+          <span class="sess"><span class="dot">●</span>LX: Website</span>
+        </div>
+        <p class="runs-here">The sessions live and run <b>here</b> — not inside any of the apps.</p>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>Said plainly</h2>
+    <p><span class="accent">One Mac is the brain.</span> It runs a tiny background program and that's where your Claude coding sessions actually live and keep running — even with every app closed.</p>
+    <p><span class="teal">The apps are just windows.</span> On your phone, laptop, Mac mini — they don't run anything themselves. They show you the brain and let you type into it. Install the app on five devices and you get five windows into the same room. Nothing to set up, nothing to choose.</p>
+    <p><span class="teal">Tailscale is the tunnel.</span> Your phone at a café normally can't reach your home Mac — firewalls exist for a reason. Tailscale safely fixes that: a private, encrypted tunnel only <em>your own</em> devices can enter. No ports opened to the internet, nothing exposed. To your gear it feels like everything's on the same home Wi‑Fi, even a thousand miles apart.</p>
+    <p><span class="accent">And it stays perfectly in sync.</span> Each session is one real terminal on the brain, and every window watches that same live stream — so your phone shows the exact same thing as your laptop, character for character, at the same instant. One source, many mirrors.</p>
+  </section>
+
+  <section>
+    <h2>The question everyone asks</h2>
+    <div class="callout">
+      <p class="q">“If I install the app on my Mac mini, my laptop, and my phone — which one is the master?”</p>
+      <p><b>None of the apps.</b> The master is the Mac running the server — the brain. Every app is an equal window pointing at it.</p>
+      <p>Close every app and the sessions keep running on the brain, untouched. Open any app again and you're right back looking at them. <b>The windows are disposable; the brain is the one that matters</b> — and you pick which Mac that is (usually whichever one stays on).</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>“So where does my code actually live?”</h2>
+    <div class="callout">
+      <p class="q">“What if I make the Mac mini the brain — but my repos are on my laptop?”</p>
+      <p>The work happens on the brain, so <b>your code lives on the brain.</b> Each session runs right inside one of your project folders, on that machine. Want the Mac mini to be the brain? Your repos go on the Mac mini — then your laptop and phone need <em>no</em> code at all, they're just windows.</p>
+      <p>You're never running the same project in two places and hoping they match. It runs in <b>one</b> place and you drive it from anywhere. So the rule of thumb: <span class="accent">pick the brain to be the Mac that holds your projects and stays on.</span></p>
+    </div>
+  </section>
+
+  <section>
+    <h2>The magic part — a session survives anything</h2>
+    <p>Normally, close a terminal window and the program inside it dies. Ground Control has a small engine called <span class="teal">EZ</span> that changes that: it holds each session's terminal open in the background, <b>separate from any window looking at it.</b></p>
+    <p>So you can close every app — shut your laptop, put your phone away — and the session just keeps running on the brain. Open a window again and you snap right back to the same live one. <span class="muted-note">(It's also why every device stays perfectly in sync — they're all attached to the one real terminal, not to copies of it.)</span></p>
+    <div class="breath" style="margin-top:20px">
+      <p>And here's the part everyone loves: <b>every session writes its whole memory to a file as it goes.</b> So even if the brain Mac fully restarts — a power blip, a software update — nothing important is lost. When it comes back, it reopens each session from that file and Claude wakes up with its full memory and picks up <em>exactly</em> where it left off. The running program is disposable; the saved memory is what matters.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>“Is it contained? Can people see each other's stuff?”</h2>
+    <div class="callout">
+      <p class="q">“If a few people install this, is everyone's information walled off?”</p>
+      <p><b>Completely — it's private, per person.</b> Everyone runs their <em>own</em> server on their <em>own</em> Mac. There's no shared central server pooling data. Your server only ever touches <em>your</em> sessions on <em>your</em> machine; your code and conversations never leave your own devices.</p>
+      <p>The tunnel is per-person too: Tailscale only connects devices signed into the <b>same account</b>. Your phone reaches your Mac; nobody else's devices are on your network. Two people are two separate private networks that can't see each other — and none of it is exposed to the public internet, so only your own signed-in devices can even reach the brain.</p>
+      <p>The one shared piece — the thing that buzzes your phone — carries <b>no content</b>: just the session's name and “tap to view.” No messages, nothing stored.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>The four pieces</h2>
+    <dl class="glo">
+      <dt>The brain</dt><dd>Your always-on Mac. Where the work happens.</dd>
+      <dt>The server</dt><dd>A small background program on the brain that runs and holds the sessions.</dd>
+      <dt>An app</dt><dd>A live window into the brain — phone or Mac. Runs nothing itself.</dd>
+      <dt>Tailscale</dt><dd>The private encrypted tunnel that lets your windows reach the brain from anywhere.</dd>
+      <dt>EZ</dt><dd>The engine that keeps each session's terminal alive in the background and lets every window share it live — so nothing dies when you close an app.</dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>Say it in one breath</h2>
+    <div class="breath">
+      <p>“One Mac runs everything and holds all the sessions — that's the <b>brain</b>. Every app, on every device, is just a live <b>window</b> into that brain, connected through a private encrypted tunnel called Tailscale. There's no master <em>app</em> — the master is the <b>Mac</b>. Close the windows and the work keeps running; open them and you're looking right back in.”</p>
+    </div>
+  </section>
+
+  <footer>Ground Control — one brain, many windows, one private tunnel.</footer>
+
+</div>
+
+</body>
+</html>
