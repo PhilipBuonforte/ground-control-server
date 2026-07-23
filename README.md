@@ -35,8 +35,22 @@ and wires up Claude Code's alert hooks.
 - **Mac**: download **Ground Control.app** from the
   [latest release](https://github.com/PhilipBuonforte/ground-control-server/releases/latest),
   unzip, drag into `/Applications`.
-  First launch: macOS may warn it's from an unidentified developer — go to
-  **System Settings → Privacy & Security → Open Anyway** (one time only).
+
+### 4. First launch on the Mac (one time)
+
+macOS will block the first open: *"Apple could not verify Ground Control…"*.
+That's normal — the app isn't from the App Store. Fix, one time:
+
+1. Click **Done** on the warning (not Move to Trash)
+2. Open **System Settings → Privacy & Security**
+3. Scroll down — you'll see *"Ground Control was blocked"*
+4. Click **Open Anyway**, then **Open** on the confirm
+
+Or skip all of that with one Terminal line:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Ground Control.app"
+```
 
 Open either app, paste your server address from step 2, and you're in.
 
@@ -65,6 +79,7 @@ Open either app, paste your server address from step 2, and you're in.
 
 ## Troubleshooting
 
+- **"Apple could not verify" on open** → see step 4 above (Privacy & Security → Open Anyway)
 - **App can't connect** → is Tailscale signed in and toggled ON on the iPhone?
 - **No address printed** → sign into Tailscale on the Mac, re-run the installer
 
