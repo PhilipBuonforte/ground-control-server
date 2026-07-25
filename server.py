@@ -620,6 +620,26 @@ def _run_injection(session_id: str, cwd: str, text: str, resume: bool):
             _jobs[session_id] = {"status": "error", "error": str(e), "finished": time.time()}
 
 
+def _flush_restored_input(name: str):
+    """After an ESC interrupt, submit any message Claude Code restored into the
+    terminal's input line (queued mid-turn sends come back UNSENT). Detection is
+    strict: a line starting with ❯ that has text after it, sitting directly
+    under a horizontal rule (the composer box top). Dialog/menu ❯ pointers are
+    inside │-bordered boxes and never match."""
+    for _ in range(2):  # the interrupt redraw can lag; check twice
+        time.sleep(0.9)
+        try:
+            lines = gc_ez._render_lines(name) or []
+        except Exception:
+            return
+        for i, ln in enumerate(lines):
+            st = ln.strip()
+            if st.startswith("❯") and st[1:].strip():
+                if i > 0 and lines[i - 1].lstrip().startswith("───"):
+                    gc_ez.send_input(name, "\r")
+                    return
+
+
 @app.post("/api/session/{project_dir}/{session_id}/stop")
 def stop_session(project_dir: str, session_id: str):
     # EZ terminal session (the "brain") → interrupt the live turn by sending ESC
@@ -631,6 +651,14 @@ def stop_session(project_dir: str, session_id: str):
     ez = ez_name_for(session_id)
     if gc_ez.is_alive(ez):
         gc_ez.send_input(ez, "\x1b")
+        # Claude Code restores queued (mid-turn) messages into the composer
+        # UNSENT on interrupt — in a terminal you'd press Enter yourself, but a
+        # chat-initiated ESC would strand them there forever (the stuck-QUEUED
+        # bug). Follow up: once the interrupt redraw lands, if text is sitting
+        # in the input line (❯ …, directly under the box's rule line — menus'
+        # ❯ pointers never are), press Enter for the user. An extra Enter on an
+        # empty composer is a no-op, so the worst case is harmless.
+        threading.Thread(target=_flush_restored_input, args=(ez,), daemon=True).start()
         return {"ok": True, "stopped": True, "what": "terminal esc"}
     # Owned session → interrupt the current turn without killing the process.
     if _sessions.is_owned_live(session_id):
@@ -661,6 +689,162 @@ def stop_session(project_dir: str, session_id: str):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------- iMessage assistant
+# The always-on iMessage agent (separate LaunchAgent, has Full Disk Access) reads
+# ~/.imessage-agent/config.json every loop and writes actions.jsonl. The GC app flips
+# the toggle by writing config here, and watches the feed by reading the log. The
+# server itself needs no special permission — it only touches these two plain files.
+_IMSG_DIR = Path.home() / ".imessage-agent"
+_IMSG_CONFIG = _IMSG_DIR / "config.json"
+_IMSG_LOG = _IMSG_DIR / "actions.jsonl"
+
+
+def _imsg_running() -> bool:
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5).stdout
+        return "com.philipbuonforte.imessage-agent" in out
+    except Exception:
+        return False
+
+
+def _imsg_config() -> dict:
+    try:
+        c = json.load(open(_IMSG_CONFIG))
+    except Exception:
+        c = {}
+    return {"enabled": bool(c.get("enabled", False)), "dry_run": bool(c.get("dry_run", True))}
+
+
+@app.get("/api/imessage/status")
+def imessage_status():
+    cfg = _imsg_config()
+    installed = _IMSG_DIR.exists()
+    # quick counts from the log tail
+    replied = seen = 0
+    try:
+        lines = _IMSG_LOG.read_text().splitlines()[-500:]
+        for ln in lines:
+            try:
+                e = json.loads(ln)
+            except Exception:
+                continue
+            if e.get("event") == "decision":
+                seen += 1
+                if e.get("decision", {}).get("action") == "reply":
+                    replied += 1
+    except Exception:
+        pass
+    return {"installed": installed, "running": _imsg_running(),
+            "enabled": cfg["enabled"], "dry_run": cfg["dry_run"],
+            "seen": seen, "replied": replied}
+
+
+class IMsgConfig(BaseModel):
+    enabled: bool | None = None
+    dry_run: bool | None = None
+
+
+@app.post("/api/imessage/config")
+def imessage_set_config(body: IMsgConfig):
+    cfg = _imsg_config()
+    if body.enabled is not None:
+        cfg["enabled"] = body.enabled
+    if body.dry_run is not None:
+        cfg["dry_run"] = body.dry_run
+    _IMSG_DIR.mkdir(exist_ok=True)
+    json.dump(cfg, open(_IMSG_CONFIG, "w"))
+    return {"ok": True, **cfg}
+
+
+_IMSG_PENDING = _IMSG_DIR / "pending.json"
+_IMSG_SEND = Path.home() / ".claude/skills/send-text/send_imessage.sh"
+
+
+def _load_pending() -> list:
+    try:
+        return json.load(open(_IMSG_PENDING))
+    except Exception:
+        return []
+
+
+def _save_pending(items):
+    json.dump(items, open(_IMSG_PENDING, "w"))
+
+
+@app.get("/api/imessage/pending")
+def imessage_pending():
+    """Drafts waiting for your approval (draft mode). Newest first."""
+    return {"items": list(reversed(_load_pending()))}
+
+
+@app.post("/api/imessage/pending/{pid}/send")
+def imessage_pending_send(pid: str):
+    items = _load_pending()
+    draft = next((d for d in items if d.get("id") == pid), None)
+    if not draft:
+        return JSONResponse({"error": "draft not found"}, status_code=404)
+    # Send via the same script the agent uses (Messages control + Full Disk Access).
+    try:
+        r = subprocess.run([str(_IMSG_SEND), "--chat", draft["chat"], draft["reply"]],
+                           capture_output=True, text=True, timeout=30)
+        ok = r.returncode == 0
+    except Exception as e:
+        return JSONResponse({"error": f"send failed: {e}"}, status_code=502)
+    _save_pending([d for d in items if d.get("id") != pid])
+    # record it in the activity log as sent-by-you
+    try:
+        with open(_IMSG_LOG, "a") as f:
+            f.write(json.dumps({"event": "action", "action": "reply", "sent": True,
+                                "approved": True, "sender": draft["sender"],
+                                "would_send": draft["reply"],
+                                "ts": __import__("datetime").datetime.now().isoformat(timespec="seconds")}) + "\n")
+    except Exception:
+        pass
+    return {"ok": ok}
+
+
+@app.post("/api/imessage/pending/{pid}/dismiss")
+def imessage_pending_dismiss(pid: str):
+    items = _load_pending()
+    _save_pending([d for d in items if d.get("id") != pid])
+    return {"ok": True}
+
+
+@app.get("/api/imessage/activity")
+def imessage_activity(limit: int = 50):
+    """Human-facing feed: recent texts the agent saw + what it decided."""
+    out = []
+    try:
+        lines = _IMSG_LOG.read_text().splitlines()
+    except Exception:
+        return {"items": []}
+    for ln in reversed(lines):
+        if len(out) >= max(1, min(limit, 200)):
+            break
+        try:
+            e = json.loads(ln)
+        except Exception:
+            continue
+        ev = e.get("event")
+        if ev == "decision":
+            d = e.get("decision", {})
+            # Only "ignored" decisions belong in the history feed. A reply-decision is
+            # either sitting in the pending queue (its own section) or will appear as a
+            # "sent" action — showing it here too would double it / mislabel it.
+            if d.get("action") == "none":
+                out.append({"kind": "decision", "ts": e.get("ts"),
+                            "sender": e.get("sender"), "text": e.get("in"),
+                            "action": "none", "reason": d.get("reason")})
+        elif ev == "action" and e.get("action") == "reply" and e.get("sent"):
+            out.append({"kind": "sent", "ts": e.get("ts"),
+                        "sender": e.get("sender"),
+                        "reply": e.get("would_send") or e.get("decision", {}).get("text")})
+        elif ev in ("toggle", "killswitch"):
+            out.append({"kind": ev, "ts": e.get("ts"),
+                        "enabled": e.get("enabled"), "state": e.get("state")})
+    return {"items": out}
 
 
 # ---------------------------------------------------------------- usage analytics

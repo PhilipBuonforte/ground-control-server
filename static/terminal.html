@@ -100,7 +100,12 @@
 <script>
 const params = new URLSearchParams(location.search);
 const NAME = params.get("name") || "";
-document.getElementById("name").textContent = NAME ? NAME.slice(0,8) : "no session";
+// Header shows the session's DISPLAY TITLE (renames included). The old 8-char
+// slice was for UUID handles and mangled human names ("GC Two Claude" → "GC Two C").
+const TITLE = params.get("title") || "";
+const looksUuid = /^[0-9a-f]{8}-[0-9a-f]{4}/i.test(NAME);
+document.getElementById("name").textContent =
+  TITLE || (NAME ? (looksUuid ? NAME.slice(0,8) : NAME) : "no session");
 // Detect phones up front — the renderer choice depends on it (WebGL flickers in
 // a WKWebView, so phones must use Canvas from the start, not as a fallback).
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || window.matchMedia("(pointer:coarse)").matches || params.get("mobile") === "1";
