@@ -209,10 +209,12 @@ def parse_turns(path: Path):
     """Return conversation turns following the active branch (last leaf → root)."""
     lines = _read_lines(path)
     nodes = {}
+    order = {}   # uuid -> file position, for merging off-branch turns in place
     leaf = None
-    for e in lines:
+    for i, e in enumerate(lines):
         if e.get("uuid"):
             nodes[e["uuid"]] = e
+            order[e["uuid"]] = i
             if _is_turn(e):
                 leaf = e
     turns = []
@@ -283,6 +285,54 @@ def parse_turns(path: Path):
             continue
         t.pop("_tool_echo", None)
         deduped.append(t)
+    # Mid-turn messages are DEAD-END nodes: Claude Code writes the queued user
+    # message as a child of the in-flight assistant record, but the reply chain
+    # continues through the tool_result SIBLING — so the leaf→root walk never
+    # visits them and chat silently hid every message sent while working (the
+    # stuck-QUEUED-visual bug). Merge them back in: a user record that branches
+    # OFF the active chain (parent on-branch, itself unvisited) is a message
+    # Phil really sent. The parent-in-seen guard keeps pre-compaction/old-branch
+    # history out.
+    extras = []
+
+    def _add_extra(uuid, clean, images, ts, idx):
+        # ESC-drained duplicates: the same text re-sent as a REAL turn just
+        # after the dead-end node → show only the real one. Same guard between
+        # extras (a message can leave both a dead-end node and an attachment).
+        s = clean.strip()
+        if any(t["role"] == "user" and (t["text"] or "").strip() == s
+               and abs(order.get(t["id"], idx) - idx) < 400
+               for t in deduped + extras):
+            return
+        order[uuid] = idx
+        extras.append({"id": uuid, "role": "user", "text": clean,
+                       "images": images, "ts": ts})
+
+    for i, e in enumerate(lines):
+        if (e.get("type") == "user" and e.get("uuid")
+                and e["uuid"] not in seen
+                and not e.get("isSidechain")
+                and e.get("parentUuid") in seen):
+            text = _msg_text(e)
+            if not text or _is_harness_noise(text):
+                continue
+            clean, images = _extract_images(_strip_system_blocks(text))
+            if clean or images:
+                _add_extra(e["uuid"], clean, images, e.get("timestamp"), i)
+        # Shape 2: some mid-turn sends never get a user node at all — just an
+        # `attachment` record with the prompt (queue-op enqueue → remove).
+        elif e.get("type") == "attachment" and e.get("uuid"):
+            att = e.get("attachment") or {}
+            if (att.get("type") == "queued_command"
+                    and (att.get("origin") or {}).get("kind") == "human"):
+                prompt = (att.get("prompt") or "").strip()
+                if prompt and not _is_harness_noise(prompt):
+                    clean, images = _extract_images(prompt)
+                    if clean or images:
+                        _add_extra(e["uuid"], clean, images,
+                                   att.get("timestamp") or e.get("timestamp"), i)
+    if extras:
+        deduped = sorted(deduped + extras, key=lambda t: order.get(t["id"], 0))
     return deduped
 
 
