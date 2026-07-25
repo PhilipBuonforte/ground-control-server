@@ -3465,16 +3465,32 @@ def send_apns(title, body, dir_="", sid="", badge=None):
         # session name and a generic line. Full content stays on the user's
         # own devices and tailnet.
         generic = "Tap to view" if body else ""
+        dead = []
+        # collapse-id: duplicate tokens (app reinstalls register anew) or double
+        # sends can never STACK banners — iOS merges same-id pushes into one.
+        collapse = f"gc-{sid or 'alert'}-{int(time.time())}"
         with httpx.Client(timeout=10) as client:
             for tok in tokens:
                 try:
                     r = client.post(RELAY_URL, json={
                         "token": tok, "title": title, "body": generic,
-                        "dir": dir_, "id": sid, "badge": badge})
+                        "dir": dir_, "id": sid, "badge": badge,
+                        "collapse": collapse})
                     if r.status_code == 200:
-                        sent += 1
+                        j = r.json()
+                        if j.get("ok"):
+                            sent += 1
+                        elif j.get("reason") == "Unregistered":
+                            dead.append(tok)   # stale token from an old install
                 except Exception:  # noqa: BLE001
                     pass
+        if dead:
+            try:
+                live = [t for t in _apns_tokens() if t not in dead]
+                APNS_TOKENS_PATH.write_text(json.dumps(live))
+                print(f"[apns] pruned {len(dead)} dead token(s)", flush=True)
+            except OSError:
+                pass
         return sent
     import httpx
 
