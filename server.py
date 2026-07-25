@@ -3809,9 +3809,10 @@ def set_mute(body: MuteBody):
     return {"ok": True, "mute_remaining": remaining}
 _pending = {}     # session_id -> {fire_at, sig, title, body, dir}
 _pending_lock = threading.Lock()
-_ALERT_DEBOUNCE = 5   # seconds of CONTINUOUS idle required after the Stop hook before we
-                      # actually alert — a session that pauses ~2s then resumes on its own
-                      # must NOT produce an alert. Any activity restarts this clock.
+_ALERT_DEBOUNCE = 10  # seconds of CONTINUOUS idle required after the Stop hook before we
+                      # actually alert — a session that pauses then resumes on its own
+                      # (queued follow-up, hook chain, next step spinning up) must NOT
+                      # produce a premature "done". Any activity restarts this clock.
 
 
 def _tsig(path):
@@ -4355,6 +4356,18 @@ def _alert_worker():
                 ez = ez_name_for(sid)
                 working = (gc_ez.is_alive(ez) and gc_ez.is_working(ez, allow_snapshot=True) is True) \
                     or _subagent_running(sid)
+                if not working:
+                    # Transcript progress counts as work too: a continuation that
+                    # hasn't painted the terminal yet still WRITES the transcript
+                    # (tool records, assistant turns). Quiet terminal + fresh writes
+                    # = not done — this was the premature-"done" blind spot.
+                    tp = p.get("transcript")
+                    if tp:
+                        try:
+                            if now - os.stat(tp).st_mtime < 8:
+                                working = True
+                        except OSError:
+                            pass
                 if working:
                     p["fire_at"] = now + _ALERT_DEBOUNCE
                     continue
