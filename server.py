@@ -1836,7 +1836,15 @@ def adopt_into_app(body: AdoptIntoAppBody):
         return JSONResponse({"ok": False, "reason": "not_found"}, status_code=404)
     title, preview, cwd = session_meta(path)
     name = ((title or preview or "Adopted session").strip().replace("\n", " "))[:60]
-    _forge_desktop_record(sid, cwd or str(Path.home()), name)
+    # Reuse an existing record (un-archive it) rather than forging a duplicate —
+    # two records for one sid makes archive/rename appear to "not work" (one gets
+    # marked, the sidebar reads the other).
+    f, d = _find_record_file(sid)
+    if f:
+        d["isArchived"] = False
+        json.dump(d, open(f, "w"))
+    else:
+        _forge_desktop_record(sid, cwd or str(Path.home()), name)
     _add_owned(sid)
     mark_expecting(sid)   # the user explicitly pulled it in → alerts allowed
     return {"ok": True, "title": name}
@@ -2915,11 +2923,21 @@ def place_session(session_id: str, body: PlaceBody):
 
 @app.post("/api/session/{session_id}/archive")
 def archive_session(session_id: str):
-    f, d = _find_record_file(session_id)
-    if not f:
+    # Archive EVERY record for this sid. Duplicate records exist (e.g. adopting a
+    # session that already had an old record forged a second one) — marking only
+    # the first match left the session visible via the other record.
+    hit = False
+    for f in DESKTOP_DIR.glob("claude-code-sessions/*/*/local_*.json"):
+        try:
+            d = json.load(open(f))
+            if d.get("cliSessionId") == session_id:
+                d["isArchived"] = True
+                json.dump(d, open(f, "w"))
+                hit = True
+        except (json.JSONDecodeError, OSError):
+            pass
+    if not hit:
         return JSONResponse({"error": "session not found"}, status_code=404)
-    d["isArchived"] = True
-    json.dump(d, open(f, "w"))
     return {"ok": True}
 
 

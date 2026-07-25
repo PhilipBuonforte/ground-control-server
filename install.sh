@@ -142,6 +142,31 @@ else
   URL="$("$TS" status --json 2>/dev/null | "$INSTALL_DIR/venv/bin/python3" -c 'import json,sys; d=json.load(sys.stdin); print("https://"+d["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)"
 fi
 
+# ── Mac app: install/refresh from the latest release ─────────────────────────
+# One command does everything: server AND app, no manual download, and the
+# quarantine strip means macOS never shows the "could not verify" block.
+echo ""
+echo "→ Installing the Ground Control Mac app…"
+APP_TMP="$(mktemp -d)"
+if curl -fsSL -o "$APP_TMP/app.zip" \
+     "https://github.com/PhilipBuonforte/ground-control-server/releases/latest/download/GroundControl-mac.zip" 2>/dev/null; then
+  ditto -x -k "$APP_TMP/app.zip" "$APP_TMP" 2>/dev/null || true
+  if [ -d "$APP_TMP/Ground Control.app" ]; then
+    osascript -e 'tell application "Ground Control" to quit' >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "/Applications/Ground Control.app"
+    cp -R "$APP_TMP/Ground Control.app" "/Applications/Ground Control.app"
+    xattr -dr com.apple.quarantine "/Applications/Ground Control.app" 2>/dev/null || true
+    open "/Applications/Ground Control.app" || true
+    ok "Mac app installed to /Applications (launched)"
+  else
+    warn "Downloaded app looked wrong — grab it manually from the releases page."
+  fi
+else
+  warn "Couldn't download the Mac app — grab it from the releases page."
+fi
+rm -rf "$APP_TMP"
+
 echo ""
 echo "  ╔════════════════════════════════════╗"
 echo -e "  ║   ${GREEN}Setup complete!${NC}                  ║"
@@ -157,6 +182,7 @@ fi
 echo ""
 echo "  Next steps:"
 echo "  1. iPhone app  → TestFlight: TESTFLIGHT_LINK_HERE"
-echo "  2. Mac app     → https://github.com/PhilipBuonforte/ground-control-server/releases/latest"
-echo "  3. Open either app → paste your server address → done."
+echo "  2. The Mac app just opened → paste your server address → done."
+echo ""
+echo "  To update everything later: re-run this same command."
 echo ""
