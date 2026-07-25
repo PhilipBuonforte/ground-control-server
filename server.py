@@ -4248,6 +4248,52 @@ def _call_check():
         print(f"[alert] {time.strftime('%H:%M:%S')} CALL {sid[:8]} -> {number} (unread {int(now-float(marked_ts))}s)", flush=True)
 
 
+_GROUPS_SHADOW = Path.home() / ".ground-control" / "groups_shadow.json"
+
+
+def _groups_guard():
+    """Self-healing shadow for group assignments. The Claude desktop app
+    periodically rewrites its config and DROPS our customGroupAssignments/
+    customGroupOrder keys (it wiped Phil's groups twice in two days). Snapshot
+    them to GC's own file whenever they're non-empty; if they ever vanish while
+    the shadow has them, write them straight back."""
+    cfg = _desktop_config()
+    sl = ((cfg.get("preferences") or {}).get("epitaxyPrefs") or {}).get("dframe-local-slice") or {}
+    assign = sl.get("customGroupAssignments") or {}
+    order = sl.get("customGroupOrder") or {}
+    if assign:
+        # live state exists → keep the shadow current
+        snap = {"customGroupAssignments": assign, "customGroupOrder": order}
+        try:
+            old = json.load(open(_GROUPS_SHADOW)) if _GROUPS_SHADOW.exists() else None
+        except (OSError, json.JSONDecodeError):
+            old = None
+        if old != snap:
+            try:
+                _GROUPS_SHADOW.parent.mkdir(parents=True, exist_ok=True)
+                json.dump(snap, open(_GROUPS_SHADOW, "w"))
+            except OSError:
+                pass
+        return
+    # assignments GONE — restore from shadow if we have one
+    try:
+        snap = json.load(open(_GROUPS_SHADOW))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not snap.get("customGroupAssignments"):
+        return
+
+    def fn(c):
+        s = c.setdefault("preferences", {}).setdefault("epitaxyPrefs", {}).setdefault("dframe-local-slice", {})
+        if not s.get("customGroupAssignments"):
+            s["customGroupAssignments"] = snap["customGroupAssignments"]
+            s.setdefault("customGroupOrder", snap.get("customGroupOrder", {}))
+
+    _edit_desktop_config(fn)
+    print(f"[groups] desktop app wiped group assignments — restored "
+          f"{len(snap['customGroupAssignments'])} from shadow", flush=True)
+
+
 def _alert_worker():
     while True:
         time.sleep(2)   # 2s (was 5s) so a truly-idle / needs-you alert fires within ~2s
@@ -4257,6 +4303,7 @@ def _alert_worker():
             _waiting_check()
             _repeat_check()
             _call_check()
+            _groups_guard()
         except Exception as e:  # noqa: BLE001
             print(f"[alert] watchdog error: {e}", flush=True)
         now = time.time()
