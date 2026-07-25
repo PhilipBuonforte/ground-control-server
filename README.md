@@ -8,37 +8,36 @@ questions.
 Your Mac does the work; the apps are windows into it, connected privately over
 [Tailscale](https://tailscale.com) (free).
 
-## Setup (about 5 minutes)
+## Setup (about 3 minutes — no Terminal)
 
-### 1. Install the server on your Mac
+### 1. Download and open the Mac app
 
-Open **Terminal** and paste:
+[**Download Ground Control.app**](https://github.com/PhilipBuonforte/ground-control-server/releases/latest/download/GroundControl-mac.zip)
+— unzip, drag into Applications, open it.
+(First open: **right-click the app → Open → Open** to pass macOS's unsigned-app check.)
+
+### 2. Click "Set Up This Mac"
+
+That one button installs everything — the server, auto-start, and Claude Code's
+alert hooks. About a minute. When it finishes it shows your server address.
+
+### 3. iPhone
+
+- Install Tailscale (free) on your **Mac and iPhone**, signed into the **same
+  account** on both: https://tailscale.com/download
+- iPhone app: TestFlight → TESTFLIGHT_LINK_HERE — paste your server address.
+
+**Updates are automatic**: the Mac app shows an "Update available → Install" banner
+(one click updates the app AND the server); the iPhone updates through TestFlight.
+
+<details>
+<summary>Alternative: command-line install</summary>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PhilipBuonforte/ground-control-server/main/install.sh | bash
 ```
-
-This installs the server to `~/.ground-control`, keeps it running (survives reboots),
-and wires up Claude Code's alert hooks.
-
-### 2. Connect your devices with Tailscale (free)
-
-1. Install Tailscale on your **Mac** and **iPhone**: https://tailscale.com/download
-2. Sign in with the **same account** on both (Google/Apple login works); keep the
-   VPN toggle ON on the iPhone
-3. Re-run the installer command — it finishes the secure HTTPS route and
-   **prints your server address** (like `https://your-mac.your-tailnet.ts.net`)
-
-### 3. Install the iPhone app
-
-TestFlight → TESTFLIGHT_LINK_HERE
-
-The **Mac app installs itself** in step 1 (and opens when setup finishes) — nothing
-to download. Open either app, paste your server address from step 2, and you're in.
-
-**Updating later — one step:** re-run the step-1 command. It updates the server AND
-the Mac app. (The Mac app also self-updates: an "Update available" banner appears in
-the sidebar.) The iPhone app updates through TestFlight automatically.
+Does the same thing, including installing the Mac app.
+</details>
 
 ## What you need
 
