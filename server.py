@@ -4037,6 +4037,10 @@ def _watchdog_check():
             continue  # Phil never engaged this session → not his concern, stay silent
         if sid in _quiet_alerted:
             continue  # already alerted for this quiet episode (re-arms only on real work)
+        if _alerted_since.get(sid, 0) >= mtime:
+            continue  # PERSISTED dedupe: already alerted for this activity — survives
+                      # server restarts (the in-memory set above doesn't, and restart
+                      # loops re-buzzed the same quiet sessions over and over)
         with _pending_lock:
             if sid in _pending:
                 continue
@@ -4051,7 +4055,7 @@ def _watchdog_check():
         n_web = send_push(title, "Went quiet without finishing — may need you", path.parent.name, sid)
         n_apns = send_apns(title, "Went quiet without finishing — may need you", path.parent.name, sid,
                            badge=mark_unread(sid))
-        print(f"[alert] WATCHDOG {sid[:8]} -> web:{n_web} apns:{n_apns}: {title}", flush=True)
+        print(f"[alert] {time.strftime('%H:%M:%S')} WATCHDOG {sid[:8]} -> web:{n_web} apns:{n_apns}: {title}", flush=True)
 
 
 _last_alerted = {}  # session_id -> epoch of last push we sent for it
