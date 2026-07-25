@@ -1781,6 +1781,46 @@ def groundzero():
             "owned": owned, "external": external}
 
 
+@app.post("/api/self-update")
+def self_update():
+    """Update an INSTALLED server (~/.ground-control) in place from the public repo,
+    then exit so launchd restarts it on the new code. The Mac app's update banner
+    calls this before swapping the app — one click updates everything. Phil's dev
+    server (repo checkout) declines; it's updated by editing the source."""
+    install_dir = Path(__file__).resolve().parent
+    if install_dir != (Path.home() / ".ground-control"):
+        return {"ok": False, "reason": "dev_server"}
+    import io
+    import tarfile
+    import tempfile
+    import urllib.request as _ur
+    try:
+        url = "https://github.com/PhilipBuonforte/ground-control-server/archive/refs/heads/main.tar.gz"
+        data = _ur.urlopen(url, timeout=30).read()
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            tmp = Path(tempfile.mkdtemp(prefix="gc-selfupdate-"))
+            tar.extractall(tmp)   # noqa: S202 — our own repo tarball
+            src = next(tmp.glob("ground-control-server-*"))
+            for f in ["server.py", "gc_ez.py", "gc_ez_engine.py", "gc_sessions.py",
+                      "run_server.sh", "requirements.txt"]:
+                if (src / f).exists():
+                    shutil.copy(src / f, install_dir / f)
+            for d in ["static", "ezterminfo"]:
+                if (src / d).exists():
+                    shutil.rmtree(install_dir / d, ignore_errors=True)
+                    shutil.copytree(src / d, install_dir / d)
+            hook = src / "hooks" / "pocket-claude-notify.py"
+            if hook.exists():
+                (Path.home() / ".claude" / "hooks").mkdir(parents=True, exist_ok=True)
+                shutil.copy(hook, Path.home() / ".claude" / "hooks" / "pocket-claude-notify.py")
+            shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=500)
+    # Exit AFTER the response flushes; launchd brings us back on the new code.
+    threading.Timer(1.0, lambda: os._exit(0)).start()
+    return {"ok": True, "restarting": True}
+
+
 # --- Adopt existing sessions into the app ------------------------------------
 # Sessions born OUTSIDE Ground Control (a plain `claude` in Terminal.app) can be
 # brought in: dormant ones are marked owned + get a sidebar record, and wake as
