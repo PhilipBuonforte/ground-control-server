@@ -38,7 +38,22 @@ def _find_claude_bin():
         return found
     for c in (Path.home() / ".local" / "bin" / "claude",
               Path("/opt/homebrew/bin/claude"),
-              Path("/usr/local/bin/claude")):
+              Path("/usr/local/bin/claude"),
+              Path.home() / ".claude" / "local" / "claude"):
+        if c.exists():
+            return str(c)
+    # npm/nvm installs live under version-specific dirs launchd can't see (its PATH
+    # is bare) — a real user's `claude` was invisible to the server this way. Ask the
+    # user's LOGIN shell, which has their real PATH.
+    try:
+        out = subprocess.run(["/bin/zsh", "-lic", "command -v claude"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        if out and os.path.exists(out.splitlines()[-1]):
+            return out.splitlines()[-1]
+    except Exception:  # noqa: BLE001
+        pass
+    # nvm's default layout, direct
+    for c in sorted(Path.home().glob(".nvm/versions/node/*/bin/claude"), reverse=True):
         if c.exists():
             return str(c)
     return "claude"

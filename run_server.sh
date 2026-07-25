@@ -30,9 +30,9 @@ sleep 1
 # Ensure deps — pyte is the working-state renderer; fastapi/uvicorn/httpx are the
 # server itself. Cheap no-op when already installed. (Venv installs never need
 # --break-system-packages; the Homebrew/system fallback does.)
-if ! "$PY" -c "import pyte, fastapi, uvicorn, httpx, multipart" 2>/dev/null; then
-  "$PY" -m pip install -q pyte fastapi uvicorn httpx python-multipart 2>/dev/null || \
-    "$PY" -m pip install --break-system-packages -q pyte fastapi uvicorn httpx python-multipart 2>/dev/null || true
+if ! "$PY" -c "import pyte, fastapi, uvicorn, httpx" 2>/dev/null; then
+  "$PY" -m pip install -q pyte fastapi uvicorn httpx 2>/dev/null || \
+    "$PY" -m pip install --break-system-packages -q pyte fastapi uvicorn httpx 2>/dev/null || true
 fi
 
 # Self-heal remote access: if Tailscale is present and logged in but its HTTPS
