@@ -7,8 +7,10 @@ desktop-app process first so history never forks).
 import glob
 import json
 import os
+import re
 import shutil
 import signal
+import sqlite3
 import urllib.parse
 import subprocess
 import threading
@@ -765,7 +767,254 @@ def _imsg_config() -> dict:
         c = json.load(open(_IMSG_CONFIG))
     except Exception:
         c = {}
-    return {"enabled": bool(c.get("enabled", False)), "dry_run": bool(c.get("dry_run", True))}
+    threads = c.get("threads") or {}
+    if not isinstance(threads, dict):
+        threads = {}
+    # per-thread override ∈ {"default","off","draft","send"}; "default" (or absent)
+    # follows the global enabled/dry_run. Keep only valid values.
+    threads = {k: v for k, v in threads.items() if v in ("off", "draft", "send")}
+    return {"enabled": bool(c.get("enabled", False)),
+            "dry_run": bool(c.get("dry_run", True)),
+            "threads": threads}
+
+
+def _imsg_effective_mode(sender: str, cfg: dict) -> str:
+    """Resolve a thread to off/draft/send. Master switch gates everything; a
+    per-thread override then narrows or widens within the ON state."""
+    ov = (cfg.get("threads") or {}).get(sender)
+    if ov in ("off", "draft", "send"):
+        # An explicit override still requires the master switch to be ON — OFF
+        # means hard-off everywhere (the kill switch stays a kill switch).
+        return "off" if not cfg["enabled"] else ov
+    if not cfg["enabled"]:
+        return "off"
+    return "draft" if cfg["dry_run"] else "send"
+
+
+# ── contact / thread name resolution ─────────────────────────────────────────
+# Show the SAME names the user sees in Messages: contact names for 1:1 chats
+# (from macOS Contacts) and group display names (from chat.db). Built once and
+# cached — contacts/group names change rarely.
+_AB_GLOB = str(Path.home() / "Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb")
+_CHATDB = Path.home() / "Library/Messages/chat.db"
+_name_cache = {"ts": 0.0, "phones": {}, "emails": {}, "groups": {}}
+_NAME_TTL = 600
+
+
+def _digits10(s: str) -> str:
+    d = re.sub(r"\D", "", s or "")
+    return d[-10:] if len(d) >= 10 else d
+
+
+def _build_name_maps():
+    phones, emails, groups = {}, {}, {}
+
+    def full(fn, ln, org):
+        nm = " ".join(x for x in (fn, ln) if x).strip()
+        return nm or (org or "").strip()
+
+    for db in glob.glob(_AB_GLOB):
+        try:
+            c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            for fn, ln, org, num in c.execute(
+                "SELECT r.ZFIRSTNAME,r.ZLASTNAME,r.ZORGANIZATION,p.ZFULLNUMBER "
+                "FROM ZABCDPHONENUMBER p JOIN ZABCDRECORD r ON p.ZOWNER=r.Z_PK "
+                "WHERE p.ZFULLNUMBER IS NOT NULL"):
+                nm = full(fn, ln, org)
+                if nm:
+                    phones.setdefault(_digits10(num), nm)
+            for fn, ln, org, addr in c.execute(
+                "SELECT r.ZFIRSTNAME,r.ZLASTNAME,r.ZORGANIZATION,e.ZADDRESS "
+                "FROM ZABCDEMAILADDRESS e JOIN ZABCDRECORD r ON e.ZOWNER=r.Z_PK "
+                "WHERE e.ZADDRESS IS NOT NULL"):
+                nm = full(fn, ln, org)
+                if nm:
+                    emails.setdefault((addr or "").lower().strip(), nm)
+            c.close()
+        except Exception:
+            pass
+    try:
+        c = sqlite3.connect(f"file:{_CHATDB}?mode=ro", uri=True)
+        for cid, dn in c.execute(
+            "SELECT chat_identifier, display_name FROM chat "
+            "WHERE display_name IS NOT NULL AND display_name != ''"):
+            groups[cid] = dn
+        c.close()
+    except Exception:
+        pass
+    return phones, emails, groups
+
+
+def _name_maps():
+    if time.time() - _name_cache["ts"] > _NAME_TTL:
+        p, e, g = _build_name_maps()
+        if p or e or g:
+            _name_cache.update({"ts": time.time(), "phones": p, "emails": e, "groups": g})
+        else:
+            _name_cache["ts"] = time.time()   # avoid hammering on failure
+    return _name_cache
+
+
+def _contact_name(handle: str):
+    h = (handle or "").strip()
+    m = _name_maps()
+    if "@" in h:
+        return m["emails"].get(h.lower())
+    return m["phones"].get(_digits10(h))
+
+
+def _pretty_phone(s: str) -> str:
+    d = re.sub(r"\D", "", s or "")
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    if len(d) == 10:
+        return f"({d[0:3]}) {d[3:6]}-{d[6:]}"
+    return s or "?"
+
+
+def _thread_key(sender: str, chat: str) -> str:
+    """Stable per-conversation id: the group's chat_identifier for group chats,
+    else the individual handle (so old sender-keyed rows still line up)."""
+    if chat and ";+;" in chat:
+        return chat.split(";+;")[-1]
+    return sender or "?"
+
+
+def _display_title(sender: str, chat: str) -> str:
+    """The label to show — mirrors Messages: group name, contact name, or a
+    nicely formatted phone number as the last resort."""
+    if chat and ";+;" in chat:
+        cid = chat.split(";+;")[-1]
+        return _name_maps()["groups"].get(cid) or "Group chat"
+    return _contact_name(sender) or _pretty_phone(sender)
+
+
+# ── real Messages threads (chat.db) ──────────────────────────────────────────
+# So the Text Assistant inbox mirrors the actual Messages app — ALL recent
+# threads, named the same — not just the handful the agent has acted on.
+_MSG_SKIP = {'streamtyped', 'NSAttributedString', 'NSObject', 'NSString',
+             'NSDictionary', 'NSNumber', 'NSValue', 'iI', 'NSMutableAttributedString',
+             'NSAttributeInfo', 'NSMutableString'}
+
+
+def _msg_decode(text, blob) -> str:
+    if text:
+        return text
+    if not blob:
+        return ""
+    runs = [r.decode(errors="ignore") for r in re.findall(rb'[ -~]{2,}', blob)]
+
+    def ok(r):
+        if r in _MSG_SKIP or r.startswith('__k'):
+            return False
+        if 'kIM' in r or 'Attribute' in r or 'GUID' in r or r.startswith('NS'):
+            return False
+        if 'at_0_' in r or re.search(r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}', r):
+            return False   # attachment filename / UUID, not message text
+        return not re.fullmatch(r'[\x00-\x2f]*', r or '')
+
+    cand = [r for r in runs if ok(r)]
+    if not cand:
+        return ""
+    best = max(cand, key=len)
+    # typedstream length/type bytes often leak a 1-2 char junk prefix ("+%", "+F")
+    if best[:1] in "+" and len(best) > 2:
+        best = best[2:]
+    return best.strip()
+
+
+def _apple_ts(ns) -> str:
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(ns / 1e9 + 978307200).isoformat(timespec="seconds")
+    except Exception:
+        return ""
+
+
+def _group_participants_title(conn, cid: str) -> str:
+    try:
+        rows = conn.execute(
+            "SELECT h.id FROM chat c JOIN chat_handle_join chj ON chj.chat_id=c.ROWID "
+            "JOIN handle h ON h.ROWID=chj.handle_id WHERE c.chat_identifier=?", (cid,)).fetchall()
+        names = []
+        for (hid,) in rows:
+            nm = _contact_name(hid) or _pretty_phone(hid)
+            first = nm.split()[0] if nm else hid
+            if first not in names:
+                names.append(first)
+        if not names:
+            return ""
+        if len(names) <= 3:
+            return ", ".join(names)
+        return ", ".join(names[:3]) + f" & {len(names) - 3} more"
+    except Exception:
+        return ""
+
+
+_chats_cache = {"ts": 0.0, "data": []}
+_CHATS_TTL = 6
+
+
+def _recent_chats(limit: int = 40):
+    """Recent Messages threads (last message per chat), newest first."""
+    if time.time() - _chats_cache["ts"] < _CHATS_TTL and _chats_cache["data"]:
+        return _chats_cache["data"]
+    out = []
+    try:
+        c = sqlite3.connect(f"file:{_CHATDB}?mode=ro", uri=True)
+        rows = c.execute(
+            "SELECT c.chat_identifier, c.display_name, c.style, m.text, m.attributedBody, "
+            "       m.is_from_me, m.date "
+            "FROM chat c "
+            "JOIN chat_message_join j ON j.chat_id = c.ROWID "
+            "JOIN message m ON m.ROWID = j.message_id "
+            "JOIN (SELECT j2.chat_id cid, MAX(m2.date) md "
+            "      FROM chat_message_join j2 JOIN message m2 ON m2.ROWID=j2.message_id "
+            "      GROUP BY j2.chat_id) last ON last.cid = c.ROWID AND last.md = m.date "
+            "ORDER BY m.date DESC LIMIT ?", (limit,))
+        for cid, dn, style, text, ab, isme, date in rows:
+            is_group = (style == 43) or (cid or "").startswith("chat")
+            title = (dn or "").strip()
+            if not title:
+                title = (_group_participants_title(c, cid) or "Group chat") if is_group \
+                    else (_contact_name(cid) or _pretty_phone(cid))
+            txt = _msg_decode(text, ab)
+            if not txt:
+                txt = "📷 Attachment"
+            elif isme:
+                txt = "You: " + txt
+            out.append({"cid": cid, "title": title, "is_group": is_group,
+                        "last_text": txt, "ts": _apple_ts(date)})
+        c.close()
+    except Exception:
+        pass
+    if out:
+        _chats_cache.update({"ts": time.time(), "data": out})
+    return out
+
+
+def _chat_messages(cid: str, limit: int = 40):
+    """Recent real messages in one thread → bubbles for the thread view."""
+    out = []
+    try:
+        c = sqlite3.connect(f"file:{_CHATDB}?mode=ro", uri=True)
+        rows = c.execute(
+            "SELECT m.text, m.attributedBody, m.is_from_me, m.date, h.id "
+            "FROM chat c "
+            "JOIN chat_message_join j ON j.chat_id = c.ROWID "
+            "JOIN message m ON m.ROWID = j.message_id "
+            "LEFT JOIN handle h ON h.ROWID = m.handle_id "
+            "WHERE c.chat_identifier=? ORDER BY m.date DESC LIMIT ?", (cid, limit)).fetchall()
+        for text, ab, isme, date, hid in reversed(rows):
+            body = _msg_decode(text, ab)
+            if not body:
+                continue
+            out.append({"is_from_me": bool(isme), "text": body,
+                        "ts": _apple_ts(date), "handle": hid})
+        c.close()
+    except Exception:
+        pass
+    return out
 
 
 @app.get("/api/imessage/status")
@@ -811,6 +1060,30 @@ def imessage_set_config(body: IMsgConfig):
     _IMSG_DIR.mkdir(exist_ok=True)
     json.dump(cfg, open(_IMSG_CONFIG, "w"))
     return {"ok": True, **cfg}
+
+
+class IMsgThreadMode(BaseModel):
+    mode: str   # "default" | "off" | "draft" | "send"
+
+
+@app.post("/api/imessage/thread/{sender}/mode")
+def imessage_set_thread_mode(sender: str, body: IMsgThreadMode):
+    """Per-conversation override. 'default' clears the override (thread follows
+    the global setting); off/draft/send pin this one thread."""
+    cfg = _imsg_config()
+    threads = cfg.get("threads") or {}
+    m = (body.mode or "default").lower()
+    if m == "default":
+        threads.pop(sender, None)
+    elif m in ("off", "draft", "send"):
+        threads[sender] = m
+    else:
+        return {"ok": False, "error": "bad mode"}
+    cfg["threads"] = threads
+    _IMSG_DIR.mkdir(exist_ok=True)
+    json.dump(cfg, open(_IMSG_CONFIG, "w"))
+    return {"ok": True, "sender": sender,
+            "mode": m, "effective": _imsg_effective_mode(sender, cfg)}
 
 
 _IMSG_PENDING = _IMSG_DIR / "pending.json"
@@ -867,68 +1140,146 @@ def imessage_pending_dismiss(pid: str):
     return {"ok": True}
 
 
+def _pending_by_key() -> dict:
+    """thread_key -> list of pending drafts."""
+    out: dict = {}
+    for d in _load_pending():
+        k = _thread_key(d.get("sender", "?"), d.get("chat"))
+        out.setdefault(k, []).append(d)
+    return out
+
+
 @app.get("/api/imessage/conversations")
 def imessage_conversations():
-    """The agent's activity as iMessage-style threads: one conversation per sender,
-    each an ordered list of bubbles (incoming reviewed / agent-sent / pending draft),
-    plus a synthetic 'Commands' thread for your GC commands. Powers the redesigned
-    Text Assistant screen (inbox → thread)."""
-    threads: dict = {}   # key -> {sender, title, items:[...]}
-
-    def th(key, title=None):
-        t = threads.get(key)
-        if t is None:
-            t = threads[key] = {"sender": key, "title": title or key, "items": []}
-        return t
-
-    # 1) history from the agent log
-    try:
-        lines = _IMSG_LOG.read_text().splitlines()
-    except Exception:
-        lines = []
-    for ln in lines:
-        try:
-            e = json.loads(ln)
-        except Exception:
-            continue
-        ev, ts = e.get("event"), e.get("ts")
-        if ev == "decision":
-            d = e.get("decision", {})
-            th(e.get("sender", "?")) ["items"].append({
-                "type": "incoming", "ts": ts, "text": e.get("in"),
-                "ignored": d.get("action") == "none", "reason": d.get("reason")})
-        elif ev == "action" and e.get("action") == "reply" and e.get("sent"):
-            th(e.get("sender", "?"))["items"].append({
-                "type": "sent", "ts": ts,
-                "text": e.get("would_send") or e.get("decision", {}).get("text")})
-        elif ev == "command" and e.get("status") != "running":
-            th("__commands__", "Commands")["items"].append({
-                "type": "command", "ts": ts, "text": e.get("command"),
-                "result": e.get("result"), "failed": e.get("status") == "error"})
-
-    # 2) pending drafts (from pending.json) → draft bubbles in their sender's thread
-    for d in _load_pending():
-        th(d.get("sender", "?"))["items"].append({
-            "type": "draft", "ts": d.get("ts"), "text": d.get("reply"),
-            "reason": d.get("reason"), "draftId": d.get("id")})
-
+    """The Text Assistant inbox — mirrors the Messages app: ALL recent threads,
+    named the same (contact names, group names). The assistant's drafts / mode
+    overlay onto them. A synthetic 'Commands' thread carries your GC commands."""
+    cfg = _imsg_config()
+    pend = _pending_by_key()
     convos = []
-    for key, t in threads.items():
-        items = sorted(t["items"], key=lambda x: x.get("ts") or "")
-        if not items:
-            continue
-        last = items[-1]
-        preview = last.get("text") or last.get("result") or ""
+    seen = set()
+
+    def add(key, title, preview, ts, is_group):
+        seen.add(key)
+        dc = len(pend.get(key, []))
         convos.append({
-            "sender": t["sender"], "title": t["title"],
-            "lastTs": last.get("ts"),
-            "preview": preview[:80],
-            "lastType": last.get("type"),
-            "draftCount": sum(1 for i in items if i["type"] == "draft"),
-            "items": items,
+            "sender": key, "title": title,
+            "lastTs": ts, "preview": (preview or "")[:80],
+            "lastType": "draft" if dc else None,
+            "draftCount": dc, "isGroup": is_group,
+            "mode": (cfg.get("threads") or {}).get(key, "default"),
+            "effectiveMode": _imsg_effective_mode(key, cfg),
         })
+
+    # 1) real Messages threads
+    for ch in _recent_chats(40):
+        add(ch["cid"], ch["title"], ch["last_text"], ch["ts"], ch["is_group"])
+
+    # 2) any thread with a pending draft that wasn't in the recent list (older) —
+    #    never hide something waiting on you.
+    for key, drafts in pend.items():
+        if key in seen:
+            continue
+        d = max(drafts, key=lambda x: x.get("ts") or "")
+        title = _display_title(d.get("sender", key), d.get("chat"))
+        add(key, title, d.get("reply"), d.get("ts"), bool(d.get("chat") and ";+;" in d.get("chat")))
+
+    # 3) the synthetic Commands thread (from the agent log)
+    cmd_last, cmd_any = None, False
+    try:
+        for ln in _IMSG_LOG.read_text().splitlines():
+            try:
+                e = json.loads(ln)
+            except Exception:
+                continue
+            if e.get("event") == "command" and e.get("status") != "running":
+                cmd_any = True
+                cmd_last = e
+    except Exception:
+        pass
+    if cmd_any and cmd_last:
+        convos.append({
+            "sender": "__commands__", "title": "Commands",
+            "lastTs": cmd_last.get("ts"),
+            "preview": (cmd_last.get("command") or "")[:80],
+            "lastType": "command", "draftCount": 0, "isGroup": False,
+            "mode": "default", "effectiveMode": None,
+        })
+
     convos.sort(key=lambda c: c.get("lastTs") or "", reverse=True)
     return {"conversations": convos}
+
+
+@app.get("/api/imessage/thread/{key}/messages")
+def imessage_thread_messages(key: str):
+    """Full thread for the reader: the real back-and-forth from Messages, with the
+    assistant's ignored-notes / sent-markers / pending drafts overlaid."""
+    key = urllib.parse.unquote(key)
+    if key == "__commands__":
+        items = []
+        try:
+            for ln in _IMSG_LOG.read_text().splitlines():
+                try:
+                    e = json.loads(ln)
+                except Exception:
+                    continue
+                if e.get("event") == "command" and e.get("status") != "running":
+                    items.append({"type": "command", "ts": e.get("ts"),
+                                  "text": e.get("command"), "result": e.get("result"),
+                                  "failed": e.get("status") == "error"})
+        except Exception:
+            pass
+        return {"items": items, "title": "Commands"}
+
+    # agent overlays, indexed by the message text they refer to
+    ignored, sent_texts = {}, set()
+    try:
+        for ln in _IMSG_LOG.read_text().splitlines():
+            try:
+                e = json.loads(ln)
+            except Exception:
+                continue
+            if _thread_key(e.get("sender", "?"), e.get("chat")) != key:
+                continue
+            ev = e.get("event")
+            if ev == "decision":
+                d = e.get("decision", {})
+                if d.get("action") == "none" and e.get("in"):
+                    ignored[e.get("in")] = d.get("reason")
+            elif ev == "action" and e.get("action") == "reply" and e.get("sent"):
+                t = e.get("would_send") or e.get("decision", {}).get("text")
+                if t:
+                    sent_texts.add(t)
+    except Exception:
+        pass
+
+    items = []
+    for m in _chat_messages(key, 40):
+        body = m["text"]
+        if m["is_from_me"]:
+            # assistant-sent vs Phil-sent
+            if body in sent_texts:
+                items.append({"type": "sent", "ts": m["ts"], "text": body})
+            else:
+                items.append({"type": "me", "ts": m["ts"], "text": body})
+        else:
+            it = {"type": "incoming", "ts": m["ts"], "text": body}
+            if body in ignored:
+                it["ignored"] = True
+                it["reason"] = ignored[body]
+            items.append(it)
+
+    # pending drafts (not yet in chat.db) at the end
+    for d in sorted(pend_for(key), key=lambda x: x.get("ts") or ""):
+        items.append({"type": "draft", "ts": d.get("ts"), "text": d.get("reply"),
+                      "reason": d.get("reason"), "draftId": d.get("id")})
+
+    ch_title = next((c["title"] for c in _recent_chats(60) if c["cid"] == key), None)
+    return {"items": items, "title": ch_title or _display_title(key, None)}
+
+
+def pend_for(key: str):
+    return _pending_by_key().get(key, [])
 
 
 @app.get("/api/imessage/activity")
@@ -3784,12 +4135,29 @@ def _record_alert(title, body, sid, dir_):
             del _recent_alerts[:-100]
 
 
+_PUSH_COOLDOWN = 20.0   # s — must stay BELOW the 30s minimum repeat-alert interval
+_last_push_ts = {}      # sid -> epoch of the last alert actually delivered
+_last_push_lock = threading.Lock()
+
+
 def send_apns(title, body, dir_="", sid="", badge=None):
     """Send a push to every registered device via APNs HTTP/2.
 
     If this Mac has no APNs signing key (every user except the app owner),
     deliver through the Ground Control relay instead — zero user setup,
     same as any mainstream app's notification server."""
+    # PER-SESSION COOLDOWN — the one gate for every alert type and BOTH
+    # surfaces (phone push + Mac feed). One session finish can legitimately
+    # trip several triggers (stop alert, waiting alert, watchdog) within a
+    # couple seconds; Hank got 3 buzzes at once. One buzz per session per
+    # cooldown window, whatever the trigger. Repeat alerts (min 30s) clear it.
+    if sid:
+        _now = time.time()
+        with _last_push_lock:
+            if _now - _last_push_ts.get(sid, 0) < _PUSH_COOLDOWN:
+                print(f"[apns] cooldown: suppressed {sid[:8]} ({title!r})", flush=True)
+                return 0
+            _last_push_ts[sid] = _now
     # Record for the Mac app's native-notification feed BEFORE the token check —
     # every alert should reach the Mac even when no phone is registered.
     _record_alert(title, body, sid, dir_)
@@ -3806,9 +4174,11 @@ def send_apns(title, body, dir_="", sid="", badge=None):
         # own devices and tailnet.
         generic = "Tap to view" if body else ""
         dead = []
-        # collapse-id: duplicate tokens (app reinstalls register anew) or double
-        # sends can never STACK banners — iOS merges same-id pushes into one.
-        collapse = f"gc-{sid or 'alert'}-{int(time.time())}"
+        # collapse-id: ONE banner per session, always the freshest. Stable per
+        # sid (no timestamp — a timestamped id let pushes seconds apart stack,
+        # the 3-banners-at-once bug); a new alert replaces the session's old
+        # banner instead of piling up. Distinct sessions still get distinct rows.
+        collapse = f"gc-{sid or 'alert'}"
         with httpx.Client(timeout=10) as client:
             for tok in tokens:
                 try:
