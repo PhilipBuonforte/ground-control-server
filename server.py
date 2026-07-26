@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import asyncio
 
@@ -792,8 +793,12 @@ def imessage_status():
 
 
 class IMsgConfig(BaseModel):
-    enabled: bool | None = None
-    dry_run: bool | None = None
+    # Optional[...] not `bool | None` — the X | Y union syntax needs Python
+    # 3.10+ and is EVALUATED at class creation, so it crashes the whole server
+    # at import on the 3.9 that Apple ships (Hank's lockout, 2026-07-25).
+    # Installed copies run on whatever python3 the user's Mac has.
+    enabled: Optional[bool] = None
+    dry_run: Optional[bool] = None
 
 
 @app.post("/api/imessage/config")
