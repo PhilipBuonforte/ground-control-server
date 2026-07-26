@@ -862,6 +862,70 @@ def imessage_pending_dismiss(pid: str):
     return {"ok": True}
 
 
+@app.get("/api/imessage/conversations")
+def imessage_conversations():
+    """The agent's activity as iMessage-style threads: one conversation per sender,
+    each an ordered list of bubbles (incoming reviewed / agent-sent / pending draft),
+    plus a synthetic 'Commands' thread for your GC commands. Powers the redesigned
+    Text Assistant screen (inbox → thread)."""
+    threads: dict = {}   # key -> {sender, title, items:[...]}
+
+    def th(key, title=None):
+        t = threads.get(key)
+        if t is None:
+            t = threads[key] = {"sender": key, "title": title or key, "items": []}
+        return t
+
+    # 1) history from the agent log
+    try:
+        lines = _IMSG_LOG.read_text().splitlines()
+    except Exception:
+        lines = []
+    for ln in lines:
+        try:
+            e = json.loads(ln)
+        except Exception:
+            continue
+        ev, ts = e.get("event"), e.get("ts")
+        if ev == "decision":
+            d = e.get("decision", {})
+            th(e.get("sender", "?")) ["items"].append({
+                "type": "incoming", "ts": ts, "text": e.get("in"),
+                "ignored": d.get("action") == "none", "reason": d.get("reason")})
+        elif ev == "action" and e.get("action") == "reply" and e.get("sent"):
+            th(e.get("sender", "?"))["items"].append({
+                "type": "sent", "ts": ts,
+                "text": e.get("would_send") or e.get("decision", {}).get("text")})
+        elif ev == "command" and e.get("status") != "running":
+            th("__commands__", "Commands")["items"].append({
+                "type": "command", "ts": ts, "text": e.get("command"),
+                "result": e.get("result"), "failed": e.get("status") == "error"})
+
+    # 2) pending drafts (from pending.json) → draft bubbles in their sender's thread
+    for d in _load_pending():
+        th(d.get("sender", "?"))["items"].append({
+            "type": "draft", "ts": d.get("ts"), "text": d.get("reply"),
+            "reason": d.get("reason"), "draftId": d.get("id")})
+
+    convos = []
+    for key, t in threads.items():
+        items = sorted(t["items"], key=lambda x: x.get("ts") or "")
+        if not items:
+            continue
+        last = items[-1]
+        preview = last.get("text") or last.get("result") or ""
+        convos.append({
+            "sender": t["sender"], "title": t["title"],
+            "lastTs": last.get("ts"),
+            "preview": preview[:80],
+            "lastType": last.get("type"),
+            "draftCount": sum(1 for i in items if i["type"] == "draft"),
+            "items": items,
+        })
+    convos.sort(key=lambda c: c.get("lastTs") or "", reverse=True)
+    return {"conversations": convos}
+
+
 @app.get("/api/imessage/activity")
 def imessage_activity(limit: int = 50):
     """Human-facing feed: recent texts the agent saw + what it decided."""
@@ -891,6 +955,13 @@ def imessage_activity(limit: int = 50):
             out.append({"kind": "sent", "ts": e.get("ts"),
                         "sender": e.get("sender"),
                         "reply": e.get("would_send") or e.get("decision", {}).get("text")})
+        elif ev == "command":
+            # Only surface a command once (its "done"/"error" line has the result);
+            # skip the interim "running" line to avoid a duplicate row.
+            if e.get("status") != "running":
+                out.append({"kind": "command", "ts": e.get("ts"),
+                            "text": e.get("command"), "reason": e.get("result"),
+                            "action": e.get("status")})
         elif ev in ("toggle", "killswitch"):
             out.append({"kind": ev, "ts": e.get("ts"),
                         "enabled": e.get("enabled"), "state": e.get("state")})
@@ -2823,6 +2894,21 @@ def set_model(project_dir: str, session_id: str, body: ModelBody):
     return {"ok": True, "model": alias, "confirmed": confirmed, "label": label}
 
 
+_SENT_JOURNAL = Path.home() / ".ground-control" / "sent-messages.jsonl"
+
+
+def _journal_send(sid: str, text: str):
+    """Every outbound message is journaled BEFORE any routing. A TUI accident
+    (menu swallowing keystrokes, a crashed terminal) can eat the delivery, but
+    never the words — Hank lost a hand-written answer this way once."""
+    try:
+        _SENT_JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SENT_JOURNAL, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "sid": sid, "text": text}) + "\n")
+    except Exception:
+        pass
+
+
 @app.post("/api/session/{project_dir}/{session_id}/send")
 def send_message(project_dir: str, session_id: str, body: SendBody):
     path = PROJECTS_DIR / project_dir / f"{session_id}.jsonl"
@@ -2832,6 +2918,7 @@ def send_message(project_dir: str, session_id: str, body: SendBody):
     if not cwd or not os.path.isdir(cwd):
         cwd = str(Path.home())
     text = _build_text(body.text, body.attachments)
+    _journal_send(session_id, text)
     mark_expecting(session_id)   # Phil sent → allow this session to alert him about the result
     # TERMINAL IS THE BRAIN: if this session is running as a live EZ terminal, that
     # PTY is the one true process — type into it. NEVER fall through to the owned/
@@ -2842,6 +2929,20 @@ def send_message(project_dir: str, session_id: str, body: SendBody):
         # session so the two don't diverge on one transcript (chat/terminal sync).
         if _sessions.is_owned_live(session_id):
             _sessions.stop(session_id)
+        # INTERACTIVE MENU GUARD: if a question/permission dialog is on screen,
+        # typed text is eaten as menu navigation and the trailing Enter just
+        # accepts the highlighted option — Hank lost a multi-sentence custom
+        # answer exactly this way. Esc dismisses the dialog first (Claude sees
+        # "declined"), THEN the text lands in the real composer as his answer.
+        try:
+            if gc_ez.waiting_for_input(ez):
+                gc_ez.send_input(ez, "\x1b")
+                for _ in range(10):
+                    time.sleep(0.25)
+                    if not gc_ez.waiting_for_input(ez):
+                        break
+        except Exception:
+            pass
         # Type the text, THEN send Enter as a separate keystroke after a short
         # beat. Claude's Ink TUI treats a single fast write (text + "\r") as a
         # paste, so the trailing CR lands as a literal newline in the input box
