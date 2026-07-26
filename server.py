@@ -773,22 +773,29 @@ def _imsg_config() -> dict:
     # per-thread override ∈ {"default","off","draft","send"}; "default" (or absent)
     # follows the global enabled/dry_run. Keep only valid values.
     threads = {k: v for k, v in threads.items() if v in ("off", "draft", "send")}
+    scopes = c.get("scopes") or {}
+    if not isinstance(scopes, dict):
+        scopes = {}
+    # scope = list of project categories the router may reference for this thread
+    scopes = {k: [g for g in (v or []) if isinstance(g, str)]
+              for k, v in scopes.items() if v}
+    rules = c.get("rules") or {}   # per-thread free-text instructions
+    if not isinstance(rules, dict):
+        rules = {}
+    rules = {k: v for k, v in rules.items() if isinstance(v, str) and v.strip()}
     return {"enabled": bool(c.get("enabled", False)),
             "dry_run": bool(c.get("dry_run", True)),
-            "threads": threads}
+            "threads": threads, "scopes": scopes, "rules": rules}
 
 
 def _imsg_effective_mode(sender: str, cfg: dict) -> str:
-    """Resolve a thread to off/draft/send. Master switch gates everything; a
-    per-thread override then narrows or widens within the ON state."""
-    ov = (cfg.get("threads") or {}).get(sender)
-    if ov in ("off", "draft", "send"):
-        # An explicit override still requires the master switch to be ON — OFF
-        # means hard-off everywhere (the kill switch stays a kill switch).
-        return "off" if not cfg["enabled"] else ov
+    """Resolve a thread to off/draft/send. OPT-IN model: every thread is OFF by
+    default; the assistant only works a thread you explicitly turned on (draft or
+    send). The master switch is a global kill — OFF → everything off."""
     if not cfg["enabled"]:
         return "off"
-    return "draft" if cfg["dry_run"] else "send"
+    ov = (cfg.get("threads") or {}).get(sender)
+    return ov if ov in ("draft", "send") else "off"
 
 
 # ── contact / thread name resolution ─────────────────────────────────────────
@@ -807,11 +814,28 @@ def _digits10(s: str) -> str:
 
 
 def _build_name_maps():
-    phones, emails, groups = {}, {}, {}
+    # A number can map to MULTIPLE contact cards (e.g. a wife saved as both
+    # "Tara Buonforte" and "Mom" by the kids). Keep the BEST candidate, matching
+    # how Messages shows it: prefer a full first+last name over a one-word
+    # nickname/relationship label ("Mom", "Dad"), then a business name.
+    phones, emails, groups = {}, {}, {}          # key -> name
+    pscore, escore = {}, {}                       # key -> score of stored name
 
-    def full(fn, ln, org):
-        nm = " ".join(x for x in (fn, ln) if x).strip()
-        return nm or (org or "").strip()
+    def scored(fn, ln, org):
+        fn, ln, org = (fn or "").strip(), (ln or "").strip(), (org or "").strip()
+        if fn and ln:
+            return (" ".join([fn, ln]), 3)        # full personal name — best
+        if fn or ln:
+            return (fn or ln, 2)                   # a personal name beats a business label
+        if org:
+            return (org, 1)                        # business-only (e.g. a shortcode)
+        return ("", 0)
+
+    def offer(store, scores, key, fn, ln, org):
+        nm, sc = scored(fn, ln, org)
+        if nm and sc > scores.get(key, 0):
+            store[key] = nm
+            scores[key] = sc
 
     for db in glob.glob(_AB_GLOB):
         try:
@@ -820,16 +844,12 @@ def _build_name_maps():
                 "SELECT r.ZFIRSTNAME,r.ZLASTNAME,r.ZORGANIZATION,p.ZFULLNUMBER "
                 "FROM ZABCDPHONENUMBER p JOIN ZABCDRECORD r ON p.ZOWNER=r.Z_PK "
                 "WHERE p.ZFULLNUMBER IS NOT NULL"):
-                nm = full(fn, ln, org)
-                if nm:
-                    phones.setdefault(_digits10(num), nm)
+                offer(phones, pscore, _digits10(num), fn, ln, org)
             for fn, ln, org, addr in c.execute(
                 "SELECT r.ZFIRSTNAME,r.ZLASTNAME,r.ZORGANIZATION,e.ZADDRESS "
                 "FROM ZABCDEMAILADDRESS e JOIN ZABCDRECORD r ON e.ZOWNER=r.Z_PK "
                 "WHERE e.ZADDRESS IS NOT NULL"):
-                nm = full(fn, ln, org)
-                if nm:
-                    emails.setdefault((addr or "").lower().strip(), nm)
+                offer(emails, escore, (addr or "").lower().strip(), fn, ln, org)
             c.close()
         except Exception:
             pass
@@ -1068,14 +1088,15 @@ class IMsgThreadMode(BaseModel):
 
 @app.post("/api/imessage/thread/{sender}/mode")
 def imessage_set_thread_mode(sender: str, body: IMsgThreadMode):
-    """Per-conversation override. 'default' clears the override (thread follows
-    the global setting); off/draft/send pin this one thread."""
+    """Per-conversation control. OPT-IN model: 'off'/'default' turn the thread off
+    (the default — clears any override); 'draft'/'send' turn this thread ON."""
     cfg = _imsg_config()
     threads = cfg.get("threads") or {}
-    m = (body.mode or "default").lower()
-    if m == "default":
-        threads.pop(sender, None)
-    elif m in ("off", "draft", "send"):
+    m = (body.mode or "off").lower()
+    if m in ("off", "default"):
+        threads.pop(sender, None)   # off IS the default → no stored override
+        m = "off"
+    elif m in ("draft", "send"):
         threads[sender] = m
     else:
         return {"ok": False, "error": "bad mode"}
@@ -1084,6 +1105,128 @@ def imessage_set_thread_mode(sender: str, body: IMsgThreadMode):
     json.dump(cfg, open(_IMSG_CONFIG, "w"))
     return {"ok": True, "sender": sender,
             "mode": m, "effective": _imsg_effective_mode(sender, cfg)}
+
+
+def _project_categories() -> list:
+    """Distinct project categories (the desktop groups, minus the live 'Active'
+    overlay) — the buckets a thread's routing can be limited to."""
+    try:
+        d = list_sessions()
+    except Exception:
+        return []
+    out = []
+    for g in d.get("groups", []):
+        n = g.get("name")
+        if n and n != "Active" and n not in out and g.get("sessions"):
+            out.append(n)
+    return out
+
+
+@app.get("/api/imessage/project-groups")
+def imessage_project_groups():
+    return {"groups": _project_categories()}
+
+
+_IMSG_POLICIES = _IMSG_DIR / "policies.json"
+
+
+def _load_policies() -> dict:
+    try:
+        return json.load(open(_IMSG_POLICIES))
+    except Exception:
+        return {}
+
+
+@app.get("/api/imessage/projects")
+def imessage_projects():
+    """Every project (session), deduped, with its category + current sharing rules —
+    powers the 'what can each session share' editor."""
+    try:
+        d = list_sessions()
+    except Exception:
+        d = {"groups": []}
+    pols = _load_policies()
+    by_cwd = {}
+    for g in d.get("groups", []):
+        gname = g.get("name")
+        for s in g.get("sessions", []):
+            cwd = s.get("cwd")
+            if not cwd:
+                continue
+            rec = by_cwd.get(cwd)
+            if rec is None:
+                rec = by_cwd[cwd] = {"title": s.get("title") or s.get("project"),
+                                     "cwd": cwd, "category": None,
+                                     "policy": (pols.get(cwd) or "")}
+            if gname and gname != "Active" and rec["category"] is None:
+                rec["category"] = gname
+    return {"projects": sorted(by_cwd.values(),
+                               key=lambda x: (x["category"] or "zz", x["title"] or ""))}
+
+
+class IMsgPolicy(BaseModel):
+    cwd: str
+    text: str = ""
+
+
+@app.post("/api/imessage/policy")
+def imessage_set_policy(body: IMsgPolicy):
+    """Set the sharing rules for a project (by folder). Empty clears them."""
+    pols = _load_policies()
+    if (body.text or "").strip():
+        pols[body.cwd] = body.text.strip()
+    else:
+        pols.pop(body.cwd, None)
+    _IMSG_DIR.mkdir(exist_ok=True)
+    json.dump(pols, open(_IMSG_POLICIES, "w"))
+    return {"ok": True, "cwd": body.cwd, "policy": pols.get(body.cwd, "")}
+
+
+class IMsgRules(BaseModel):
+    text: str = ""
+
+
+@app.post("/api/imessage/thread/{sender}/rules")
+def imessage_set_thread_rules(sender: str, body: IMsgRules):
+    """Free-text rules for THIS conversation (e.g. 'never discuss Link-X with Tara').
+    Empty clears them."""
+    cfg = _imsg_config()
+    rules = cfg.get("rules") or {}
+    t = (body.text or "").strip()
+    if t:
+        rules[sender] = t
+    else:
+        rules.pop(sender, None)
+    cfg["rules"] = rules
+    _IMSG_DIR.mkdir(exist_ok=True)
+    json.dump(cfg, open(_IMSG_CONFIG, "w"))
+    return {"ok": True, "sender": sender, "rules": rules.get(sender, "")}
+
+
+class IMsgScope(BaseModel):
+    groups: list = []   # allowed categories; empty = any
+
+
+@app.post("/api/imessage/thread/{sender}/scope")
+def imessage_set_thread_scope(sender: str, body: IMsgScope):
+    """Limit which project categories the router may reference for THIS thread.
+    Empty list = any project (the default)."""
+    cfg = _imsg_config()
+    scopes = cfg.get("scopes") or {}
+    raw = body.groups or []
+    if "__none__" in raw:
+        groups = ["__none__"]      # explicitly NO projects (personal/general only)
+    else:
+        valid = set(_project_categories())
+        groups = [g for g in raw if g in valid]
+    if groups:
+        scopes[sender] = groups
+    else:
+        scopes.pop(sender, None)   # empty = any → no stored restriction
+    cfg["scopes"] = scopes
+    _IMSG_DIR.mkdir(exist_ok=True)
+    json.dump(cfg, open(_IMSG_CONFIG, "w"))
+    return {"ok": True, "sender": sender, "scope": groups}
 
 
 _IMSG_PENDING = _IMSG_DIR / "pending.json"
@@ -1114,8 +1257,11 @@ def imessage_pending_send(pid: str):
     if not draft:
         return JSONResponse({"error": "draft not found"}, status_code=404)
     # Send via the same script the agent uses (Messages control + Full Disk Access).
+    reply = draft["reply"]
+    if not reply.startswith("Agent:"):
+        reply = "Agent: " + reply   # recipients always know it's the assistant
     try:
-        r = subprocess.run([str(_IMSG_SEND), "--chat", draft["chat"], draft["reply"]],
+        r = subprocess.run([str(_IMSG_SEND), "--chat", draft["chat"], reply],
                            capture_output=True, text=True, timeout=30)
         ok = r.returncode == 0
     except Exception as e:
@@ -1126,11 +1272,52 @@ def imessage_pending_send(pid: str):
         with open(_IMSG_LOG, "a") as f:
             f.write(json.dumps({"event": "action", "action": "reply", "sent": True,
                                 "approved": True, "sender": draft["sender"],
-                                "would_send": draft["reply"],
+                                "would_send": reply,
                                 "ts": __import__("datetime").datetime.now().isoformat(timespec="seconds")}) + "\n")
     except Exception:
         pass
+    # If this draft promised an action, queue it so the agent routes the work now
+    # that you've actually sent the message.
+    fu = (draft.get("followup") or "").strip()
+    if ok and fu:
+        try:
+            with open(_IMSG_DIR / "followup_queue.jsonl", "a") as f:
+                f.write(json.dumps({"task": fu, "sender": draft.get("sender"),
+                                    "chat": draft.get("chat")}) + "\n")
+        except Exception:
+            pass
     return {"ok": ok}
+
+
+class IMsgEscalate(BaseModel):
+    sender: str
+    text: str = ""
+    call: Optional[bool] = None   # also phone-call Phil
+
+
+@app.post("/api/imessage/escalate")
+def imessage_escalate(body: IMsgEscalate):
+    """The texts-watcher calls this when someone asks for Phil (or it shouldn't
+    answer). Pushes to Phil's phone and — if asked — places a Bland call."""
+    who = _display_title(body.sender, None)
+    push_title = f"📱 {who} is asking for you"
+    push_body = (body.text or "")[:160]
+    try:
+        send_apns(push_title, push_body)
+    except Exception:
+        pass
+    called = False
+    if body.call:
+        num = _settings().get("call_number", "")
+        if num:
+            try:
+                called = _place_call(
+                    num, f"Hey, this is your text assistant. {who} is texting you and "
+                         f"asked to reach you. They said: {body.text[:200]}. "
+                         f"Open Ground Control when you can.")
+            except Exception:
+                called = False
+    return {"ok": True, "pushed": True, "called": called}
 
 
 @app.post("/api/imessage/pending/{pid}/dismiss")
@@ -1167,8 +1354,10 @@ def imessage_conversations():
             "lastTs": ts, "preview": (preview or "")[:80],
             "lastType": "draft" if dc else None,
             "draftCount": dc, "isGroup": is_group,
-            "mode": (cfg.get("threads") or {}).get(key, "default"),
+            "mode": (cfg.get("threads") or {}).get(key, "off"),
             "effectiveMode": _imsg_effective_mode(key, cfg),
+            "scope": (cfg.get("scopes") or {}).get(key, []),
+            "rules": (cfg.get("rules") or {}).get(key, ""),
         })
 
     # 1) real Messages threads
@@ -1232,7 +1421,7 @@ def imessage_thread_messages(key: str):
         return {"items": items, "title": "Commands"}
 
     # agent overlays, indexed by the message text they refer to
-    ignored, sent_texts = {}, set()
+    ignored, sent_texts, notes = {}, set(), []
     try:
         for ln in _IMSG_LOG.read_text().splitlines():
             try:
@@ -1250,10 +1439,22 @@ def imessage_thread_messages(key: str):
                 t = e.get("would_send") or e.get("decision", {}).get("text")
                 if t:
                     sent_texts.add(t)
+            elif ev == "dispatch":
+                st = e.get("status")
+                if st == "dispatched":
+                    txt = f"⚙️ Handling this in “{e.get('session', 'a session')}” — {e.get('task', '')}"
+                elif st == "no-session":
+                    txt = f"⚙️ No matching session for: {e.get('task', '')}"
+                else:
+                    txt = f"⚙️ {e.get('task', '')}"
+                notes.append({"type": "note", "ts": e.get("ts"), "text": txt})
+            elif ev == "escalate":
+                notes.append({"type": "note", "ts": e.get("ts"),
+                              "text": "🙋 Asked for you — texted" + (" & called you" if e.get("called") else " you")})
     except Exception:
         pass
 
-    items = []
+    items = list(notes)
     for m in _chat_messages(key, 40):
         body = m["text"]
         if m["is_from_me"]:
@@ -1274,6 +1475,7 @@ def imessage_thread_messages(key: str):
         items.append({"type": "draft", "ts": d.get("ts"), "text": d.get("reply"),
                       "reason": d.get("reason"), "draftId": d.get("id")})
 
+    items.sort(key=lambda x: x.get("ts") or "")
     ch_title = next((c["title"] for c in _recent_chats(60) if c["cid"] == key), None)
     return {"items": items, "title": ch_title or _display_title(key, None)}
 

@@ -115,36 +115,47 @@ def connect_client(name: str, cols: int = 80, rows: int = 40,
 def send_input(name: str, text: str) -> bool:
     """One-shot: type `text` into the EZ PTY WITHOUT disturbing its size (size 0,0
     tells the daemon to skip the resize). Used when the message view sends to a
-    session whose brain is a live terminal."""
+    session whose brain is a live terminal.
+
+    Connects LIVE-ONLY (flag 0x04): the daemon must NOT replay its ring buffer at
+    this throwaway client. With the old plain connect, a busy session's ~600KB
+    replay + live stream contended with this short-lived socket and the daemon
+    could tear the client down before reading its input — intermittently LOST
+    keystrokes exactly when Claude was working (Phil's hit-and-miss mid-turn
+    sends). Old daemons ignore the flag and still replay; the post-send drain
+    below keeps their write path from wedging until we're done. Retries cover
+    transient contention."""
     import select as _select
-    sp = socket_path(name)
-    if not os.path.exists(sp):
-        return False
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(5.0)
-        s.connect(sp)
-        s.sendall(struct.pack("!HH", 0, 0) + b"\x00")  # size 0 = don't resize
-        s.setblocking(False)
-        # drain the initial buffer dump so we don't wedge the daemon's sendall
-        t0 = time.time()
-        while time.time() - t0 < 1.0:
-            r, _, _ = _select.select([s], [], [], 0.15)
-            if not r:
-                break
-            try:
-                if not s.recv(65536):
+    for attempt in range(3):
+        try:
+            s = connect_client(name, 0, 0, timeout=5.0, live_only=True)
+            if s is None:
+                return False   # no socket = session gone; retrying won't help
+            s.settimeout(3.0)
+            s.sendall(text.encode())
+            # Stay connected and DRAIN briefly after sending: the daemon may be
+            # mid-write to us (live bytes, or a legacy daemon's replay); reading
+            # until quiet guarantees it can finish its write and process our
+            # input before this client vanishes.
+            s.setblocking(False)
+            t0 = time.time()
+            quiet = 0
+            while time.time() - t0 < 1.0 and quiet < 2:
+                r, _, _ = _select.select([s], [], [], 0.12)
+                if not r:
+                    quiet += 1
+                    continue
+                quiet = 0
+                try:
+                    if not s.recv(65536):
+                        break
+                except (BlockingIOError, OSError):
                     break
-            except (BlockingIOError, OSError):
-                break
-        s.setblocking(True)
-        s.settimeout(3.0)
-        s.sendall(text.encode())
-        time.sleep(0.05)
-        s.close()
-        return True
-    except OSError:
-        return False
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.15 * (attempt + 1))
+    return False
 
 
 def resize(name: str, cols: int, rows: int) -> None:
