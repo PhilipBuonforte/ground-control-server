@@ -3452,6 +3452,35 @@ def set_model(project_dir: str, session_id: str, body: ModelBody):
     return {"ok": True, "model": alias, "confirmed": confirmed, "label": label}
 
 
+@app.get("/api/fs")
+def fs_list(path: str = ""):
+    """Browse the host Mac's files so the phone can attach one directly — the
+    file already lives on the server Mac, so attaching is just its path (no
+    upload). Hidden files skipped; capped listing; home when no path given."""
+    base = Path(path).expanduser() if path.strip() else Path.home()
+    try:
+        base = base.resolve()
+        if not base.is_dir():
+            return JSONResponse({"error": "not a directory"}, status_code=404)
+        entries = []
+        for p in sorted(base.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+            if p.name.startswith("."):
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            entries.append({"name": p.name, "path": str(p),
+                            "dir": p.is_dir(), "size": int(st.st_size)})
+            if len(entries) >= 400:
+                break
+        return {"path": str(base),
+                "parent": None if base == base.parent else str(base.parent),
+                "entries": entries}
+    except OSError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 _SENT_JOURNAL = Path.home() / ".ground-control" / "sent-messages.jsonl"
 
 
