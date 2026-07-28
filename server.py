@@ -3471,7 +3471,8 @@ def fs_list(path: str = ""):
             except OSError:
                 continue
             entries.append({"name": p.name, "path": str(p),
-                            "dir": p.is_dir(), "size": int(st.st_size)})
+                            "dir": p.is_dir(), "size": int(st.st_size),
+                            "mtime": st.st_mtime})
             if len(entries) >= 400:
                 break
         return {"path": str(base),
@@ -3479,6 +3480,48 @@ def fs_list(path: str = ""):
                 "entries": entries}
     except OSError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.get("/api/fs/search")
+def fs_search(q: str, root: str = ""):
+    """Recursive filename search under `root` (home by default) for the phone's
+    Mac-file browser. Bounded hard: skips hidden/heavy dirs, depth ≤ 6, ≤ 200
+    results, ≤ 3s — a search can never wedge the server."""
+    base = Path(root).expanduser() if root.strip() else Path.home()
+    try:
+        base = base.resolve()
+        if not base.is_dir():
+            return JSONResponse({"error": "not a directory"}, status_code=404)
+    except OSError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    ql = q.lower().strip()
+    if not ql:
+        return {"path": str(base), "parent": None, "entries": []}
+    skip = {"node_modules", "Library", ".git", "venv", ".venv", "__pycache__",
+            "DerivedData", "Pods", "Movies", "Music"}
+    out, t0 = [], time.time()
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in skip]
+        try:
+            if len(Path(dirpath).relative_to(base).parts) >= 6:
+                dirnames[:] = []
+        except ValueError:
+            pass
+        for name in dirnames + filenames:
+            if name.startswith(".") or ql not in name.lower():
+                continue
+            p = Path(dirpath) / name
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out.append({"name": name, "path": str(p), "dir": p.is_dir(),
+                        "size": int(st.st_size), "mtime": st.st_mtime})
+            if len(out) >= 200:
+                break
+        if len(out) >= 200 or time.time() - t0 > 3.0:
+            break
+    return {"path": str(base), "parent": None, "entries": out}
 
 
 _SENT_JOURNAL = Path.home() / ".ground-control" / "sent-messages.jsonl"
