@@ -2760,6 +2760,7 @@ def adopt_into_app(body: AdoptIntoAppBody):
     f, d = _find_record_file(sid)
     if f:
         d["isArchived"] = False
+        _set_archived(d.get("cliSessionId") or "", False)
         json.dump(d, open(f, "w"))
     else:
         _forge_desktop_record(sid, cwd or str(Path.home()), name)
@@ -2897,21 +2898,46 @@ def list_sessions():
             pass
     ezmap = _load_ez_names()
     owned = _load_owned()
+    try:
+        ez_live = set(gc_ez.list_sessions())
+    except Exception:
+        ez_live = set()
+
+    gc_archived = _archived_set()
 
     def build_session(local_id):
         r = recs.get(local_id)
-        if not r or r.get("isArchived"):
+        if not r:
             return None
         sid = r.get("cliSessionId")
         if sid not in owned:
             return None  # app only shows sessions born in it, not the desktop-app world
-        path = idx.get(sid)
-        if path is None:
+        if sid in gc_archived:
+            return None  # GC-archived is FINAL until explicitly unarchived (adopt)
+        # Archived hides a session — UNLESS it's live. The Claude desktop app
+        # auto-archives fresh 0-turn sessions (e.g. one created with no first
+        # message), which would wrongly hide a session you JUST made. A live
+        # terminal is truth, so always show it.
+        is_live = (sid in live) or (ezmap.get(sid) in ez_live)
+        if r.get("isArchived") and not is_live:
             return None
-        try:
-            _, preview, _ = session_meta(path)
-            mtime = path.stat().st_mtime
-        except OSError:
+        path = idx.get(sid)
+        if path is not None:
+            try:
+                _, preview, _ = session_meta(path)
+                mtime = path.stat().st_mtime
+            except OSError:
+                return None
+            dir_name = path.parent.name
+        elif is_live:
+            # Live session with NO transcript yet — freshly created with no first
+            # message, so Claude hasn't written a .jsonl. Show it anyway (empty), with
+            # the project-dir slug derived from its cwd so send/resume still target it.
+            preview = ""
+            mtime = (r.get("lastActivityAt") or int(time.time() * 1000)) / 1000.0
+            cwd_slug = r.get("cwd") or ""
+            dir_name = re.sub(r'[^A-Za-z0-9]', '-', cwd_slug) if cwd_slug else sid
+        else:
             return None
         with _jobs_lock:
             job = _jobs.get(sid, {})
@@ -2919,7 +2945,7 @@ def list_sessions():
             "id": sid,
             "ezName": ezmap.get(sid, sid),
             "resumeName": sid,
-            "dir": path.parent.name,
+            "dir": dir_name,
             "title": (r.get("title") or "Untitled")[:80],
             "preview": (preview or "")[:120],
             "project": Path(r.get("cwd") or "").name,
@@ -3941,23 +3967,52 @@ def place_session(session_id: str, body: PlaceBody):
     return {"ok": True}
 
 
+_ARCHIVED_PATH = Path.home() / ".ground-control" / "archived.json"
+_archived_lock = threading.Lock()
+
+
+def _archived_set() -> set:
+    """GC's OWN archived list. The desktop app's isArchived flag lives in files
+    the desktop app REWRITES at will (same failure class that wiped groups) —
+    archived sessions kept resurrecting. This file is ours alone."""
+    try:
+        return set(json.load(open(_ARCHIVED_PATH)))
+    except (OSError, ValueError):
+        return set()
+
+
+def _set_archived(sid: str, archived: bool):
+    with _archived_lock:
+        s = _archived_set()
+        (s.add if archived else s.discard)(sid)
+        _ARCHIVED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        json.dump(sorted(s), open(_ARCHIVED_PATH, "w"))
+
+
 @app.post("/api/session/{session_id}/archive")
 def archive_session(session_id: str):
-    # Archive EVERY record for this sid. Duplicate records exist (e.g. adopting a
-    # session that already had an old record forged a second one) — marking only
-    # the first match left the session visible via the other record.
-    hit = False
+    # 1) OUR archived set — survives desktop-config rewrites, and works for
+    #    sessions with no desktop record at all (the Ungrouped 404s).
+    _set_archived(session_id, True)
+    # 2) Archive = done with it: retire the live EZ terminal too. "Live is
+    #    truth" kept archived-but-still-running sessions visible forever.
+    #    The wrapper is disposable; the transcript/identity stays on disk.
+    try:
+        ez = ez_name_for(session_id)
+        if gc_ez.is_alive(ez):
+            gc_ez.kill(ez)
+    except Exception:
+        pass
+    # 3) Best-effort: mark every desktop record too (keeps the desktop app's
+    #    own UI consistent). No 404 if none exist — our set is the truth.
     for f in DESKTOP_DIR.glob("claude-code-sessions/*/*/local_*.json"):
         try:
             d = json.load(open(f))
             if d.get("cliSessionId") == session_id:
                 d["isArchived"] = True
                 json.dump(d, open(f, "w"))
-                hit = True
         except (json.JSONDecodeError, OSError):
             pass
-    if not hit:
-        return JSONResponse({"error": "session not found"}, status_code=404)
     return {"ok": True}
 
 
