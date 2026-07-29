@@ -85,8 +85,13 @@ for event in ("Stop", "Notification", "SubagentStart", "SubagentStop"):
     flat = json.dumps(entries)
     if "pocket-claude-notify" not in flat:
         entries.append({"hooks": [{"type": "command", "command": CMD}]})
+# PreToolUse(AskUserQuestion) → exact wizard-question JSON for the chat card
+pre = hooks.setdefault("PreToolUse", [])
+if "pocket-claude-notify" not in json.dumps(pre):
+    pre.append({"matcher": "AskUserQuestion",
+                "hooks": [{"type": "command", "command": CMD}]})
 json.dump(cfg, open(p, "w"), indent=2)
-print("hook registered for Stop / Notification / SubagentStart / SubagentStop")
+print("hook registered for Stop / Notification / Subagent / PreToolUse(AskUserQuestion)")
 PYEOF
 ok "Alerts wired up"
 

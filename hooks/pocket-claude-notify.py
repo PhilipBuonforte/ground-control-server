@@ -55,6 +55,22 @@ def main():
     transcript = data.get("transcript_path", "")
     cwd = data.get("cwd", "")
 
+    # AskUserQuestion about to render → ship the EXACT question JSON to the
+    # server BEFORE the TUI draws it. The transcript doesn't flush the tool
+    # call until it's answered, and screen-scraping the phone-width two-column
+    # menu produces garbage — this hook is the only perfect-fidelity source.
+    if event == "PreToolUse":
+        if data.get("tool_name") == "AskUserQuestion":
+            tid = transcript.rstrip("/").split("/")[-1] if transcript else ""
+            if tid.endswith(".jsonl"):
+                tid = tid[:-6]
+            _post("http://127.0.0.1:8130/api/question-event", {
+                "session_id": tid or session_id,
+                "raw_session_id": session_id,
+                "tool_input": data.get("tool_input") or {},
+            })
+        return
+
     # Background-agent lifecycle → tell the server so the session reads "working"
     # while a subagent runs even when the main prompt is idle. (No alert here.)
     if event in ("SubagentStart", "SubagentStop"):

@@ -2914,13 +2914,11 @@ def list_sessions():
             return None  # app only shows sessions born in it, not the desktop-app world
         if sid in gc_archived:
             return None  # GC-archived is FINAL until explicitly unarchived (adopt)
-        # Archived hides a session — UNLESS it's live. The Claude desktop app
-        # auto-archives fresh 0-turn sessions (e.g. one created with no first
-        # message), which would wrongly hide a session you JUST made. A live
-        # terminal is truth, so always show it.
+        # NOTE: we deliberately IGNORE the desktop app's `isArchived` flag — it
+        # auto-archives fresh 0-turn sessions (a session created with no first
+        # message) and resurrects others, so it can't be trusted. GC's own
+        # archived.json above is the only archive truth.
         is_live = (sid in live) or (ezmap.get(sid) in ez_live)
-        if r.get("isArchived") and not is_live:
-            return None
         path = idx.get(sid)
         if path is not None:
             try:
@@ -3119,7 +3117,14 @@ def get_session(project_dir: str, session_id: str, limit: int = 80):
             # the answer is STILL tappable in the app. Falling back to a dead-end "Answer in
             # Terminal" button is the failure mode Phil hates: the point of the app is that
             # you are never punted into the terminal to get unstuck.
-            waiting_question = _pending_question(path) or gc_ez.terminal_question(ez)
+            # The hook cache is ONLY valid for an actual question prompt — a
+            # lingering cache entry must never label a permission/trust prompt
+            # with a previous question's options (typed digit would answer the
+            # wrong thing).
+            hook_q = _hook_question(session_id, eff) if waiting == "question" else None
+            waiting_question = (hook_q
+                                or _pending_question(path)
+                                or gc_ez.terminal_question(ez))
     # The chat used to hard-truncate to the last 80 turns, so a long session showed a
     # fraction of itself while the terminal kept the whole scrollback — "the chat and
     # the terminal don't match" (FA Markting 2: 380 turns, 300 of them invisible).
@@ -3158,6 +3163,47 @@ def type_into_terminal(project_dir: str, session_id: str, body: TypeBody):
 
 class AnswerBody(BaseModel):
     index: int = 0   # which option (0-based, in the order chat shows them)
+
+
+# EXACT pending-question cache, fed by the PreToolUse hook. The transcript
+# doesn't flush AskUserQuestion until it's ANSWERED, so chat used to fall back
+# to screen-scraping the TUI — which the new two-column question UI turns into
+# garbage (truncated labels, box-border pipes, "N lines hidden"). The hook
+# fires BEFORE the tool runs with the full question JSON: perfect fidelity.
+_question_cache = {}   # stable sid -> {"ts": epoch, "q": {...}}
+_QUESTION_TTL = 3600.0
+
+
+def _hook_question(*sids):
+    now = time.time()
+    for sid in sids:
+        e = _question_cache.get(sid)
+        if e and now - e["ts"] < _QUESTION_TTL:
+            return e["q"]
+    return None
+
+
+class QuestionEvent(BaseModel):
+    session_id: str
+    raw_session_id: Optional[str] = None
+    tool_input: dict = {}
+
+
+@app.post("/api/question-event")
+def question_event(body: QuestionEvent):
+    qs = (body.tool_input or {}).get("questions") or []
+    if not qs:
+        return {"ok": False}
+    q = qs[0]
+    sid = _stable_sid(body.session_id)
+    _question_cache[sid] = {"ts": time.time(), "q": {
+        "header": q.get("header", ""),
+        "question": q.get("question", ""),
+        "multiSelect": bool(q.get("multiSelect")),
+        "options": [{"label": o.get("label", ""), "description": o.get("description", "")}
+                    for o in (q.get("options") or [])],
+    }}
+    return {"ok": True}
 
 
 @app.post("/api/session/{project_dir}/{session_id}/answer")

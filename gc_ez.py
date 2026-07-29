@@ -815,6 +815,23 @@ def terminal_question(name: str):
         j -= 1
     if block:
         question = block[-1]
+    # LAST-RESORT sanitize: the new two-column question TUI interleaves the
+    # description panel's box borders and truncation markers into scraped rows
+    # ("│ · sign capture │ … ✂ ── 15 lines hidden"). The exact-JSON hook path
+    # normally wins before this scrape runs; when it doesn't, at least never
+    # show border glyphs / "N lines hidden" as if they were option text.
+    junk = _re.compile(r"[│┃┆┇┊┋╎╏┌┐└┘├┤╭╮╰╯⎿]|✂|[─━]{2,}|\b\d+\s+lines?\s+hidden\b")
+
+    def _scrub(t: str) -> str:
+        return _re.sub(r"\s{2,}", " ", junk.sub(" ", t)).strip(" ·|-—─ ")
+
+    question = _scrub(question)
+    for o in opts:
+        o["label"] = _scrub(o["label"])
+        o["description"] = _scrub(o["description"])
+    opts = [o for o in opts if o["label"]]
+    if len(opts) < 2:
+        return None
     return {"header": "", "question": question, "multiSelect": False, "options": opts}
 
 
