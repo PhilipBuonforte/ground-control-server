@@ -3224,6 +3224,54 @@ def _pending_question(path):
     return None
 
 
+_REWIND_CACHE = {}   # ez name -> (ts, screen_text or None)
+
+
+def _terminal_screen_text(ez: str, max_age: float = 3.0):
+    """Flattened text of the terminal's CURRENT screen, or None when it isn't a
+    trustworthy snapshot (no input box on screen = the user scrolled away, so
+    absence of a message proves nothing). Cached briefly — chat polls ~1/s."""
+    now = time.time()
+    hit = _REWIND_CACHE.get(ez)
+    if hit and now - hit[0] < max_age:
+        return hit[1]
+    out = None
+    try:
+        lines = gc_ez._render_lines(ez) or []
+        if any(l.strip() == "❯" for l in lines):     # composer visible = bottom of scroll
+            out = " ".join(l.strip() for l in lines if l.strip()).lower()
+    except Exception:  # noqa: BLE001
+        out = None
+    _REWIND_CACHE[ez] = (now, out)
+    return out
+
+
+def _trim_rewound(turns, ez: str):
+    """A /rewind writes NOTHING to the transcript until the next message, so the
+    file still ends with the abandoned branch and chat kept showing messages the
+    terminal had already dropped (they only vanished once you typed and the fork
+    was finally written). The live screen is the only thing that knows, so: if
+    the newest turns are absent from it while an older one is still there, cut
+    them. Deliberately conservative — anchor must be within the last 10 turns,
+    the composer must be on screen, and no anchor means no change."""
+    if len(turns) < 2:
+        return turns
+    screen = _terminal_screen_text(ez)
+    if not screen:
+        return turns
+
+    def visible(t):
+        body = " ".join((t.get("text") or "").split())[:36].lower()
+        return bool(body) and body in screen
+
+    if visible(turns[-1]):
+        return turns                       # fast path: nothing was rewound
+    for i in range(len(turns) - 2, max(-1, len(turns) - 11), -1):
+        if visible(turns[i]):
+            return turns[:i + 1]           # everything after the anchor is gone
+    return turns
+
+
 @app.get("/api/session/{project_dir}/{session_id}")
 def get_session(project_dir: str, session_id: str, limit: int = 80):
     # Follow /clear rotations: read the session's CURRENT conversation transcript,
@@ -3250,6 +3298,14 @@ def get_session(project_dir: str, session_id: str, limit: int = 80):
     # "running" that never cleared is exactly the phantom spinner. terminal_snapshot=True
     # reads the live terminal for the viewed session so busy tracks it instantly.
     busy = is_working(session_id, live, mtime, False, path, terminal_snapshot=True)
+    # A rewind in the terminal is invisible in the transcript until the next
+    # message; reconcile against the live screen so chat drops the rewound
+    # messages immediately instead of only after you type. Idle only — a
+    # mid-turn screen is still being painted.
+    if not busy:
+        ez_name = ez_name_for(session_id)
+        if gc_ez.is_alive(ez_name):
+            turns = _trim_rewound(turns, ez_name)
     ez = ez_name_for(session_id)
     # work.label = Claude's own status line, read from the terminal ("Brewed · 1
     # shell still running", "Julienning…") — the single source of truth. Clean timer
