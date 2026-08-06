@@ -3117,6 +3117,7 @@ def list_sessions():
         }
 
     unreads = _load_unreads()
+    _divs = _load_dividers()
     groups = []
     used = set()
     for cg, members in group_order.items():
@@ -3127,7 +3128,8 @@ def list_sessions():
             if s:
                 sessions.append(s)
         groups.append(
-            {"name": cg_names["names"].get(cg, "New Group"), "sessions": sessions}
+            {"name": cg_names["names"].get(cg, "New Group"), "sessions": sessions,
+             "dividers": _divs.get(cg, [])}
         )
     # any assigned-but-not-ordered members
     for m, cg in assign.items():
@@ -4178,6 +4180,86 @@ def place_session(session_id: str, body: PlaceBody):
 
     _edit_desktop_config(fn)
     return {"ok": True}
+
+
+# ---- Dividers: subtle labelled separators INSIDE a group -------------------
+# Kept in OUR OWN file, never in the desktop app's config: that config gets
+# rewritten by the desktop app (it wiped Phil's groups twice), and unknown
+# entries in its order list would be at its mercy. Position is `pos` = how many
+# of the group's sessions sit ABOVE the divider (0 = very top, len = bottom), so
+# it survives sessions being added, removed, or reordered.
+_DIVIDERS_PATH = Path.home() / ".ground-control" / "dividers.json"
+_dividers_lock = threading.Lock()
+
+
+def _load_dividers() -> dict:
+    try:
+        d = json.load(open(_DIVIDERS_PATH))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_dividers(d: dict):
+    _DIVIDERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    json.dump(d, open(_DIVIDERS_PATH, "w"), indent=2)
+
+
+class DividerBody(BaseModel):
+    group_id: str = ""
+    title: str = ""
+    pos: Optional[int] = None
+
+
+@app.get("/api/dividers")
+def dividers_all():
+    return _load_dividers()
+
+
+@app.post("/api/dividers")
+def divider_add(body: DividerBody):
+    import uuid as _uuid
+    title = (body.title or "").strip()[:40]
+    if not title or not body.group_id:
+        return JSONResponse({"error": "group_id and title required"}, status_code=400)
+    with _dividers_lock:
+        d = _load_dividers()
+        rows = d.setdefault(body.group_id, [])
+        rows.append({"id": "dv-" + _uuid.uuid4().hex[:10], "title": title,
+                     "pos": max(0, body.pos if body.pos is not None else 0)})
+        rows.sort(key=lambda r: r.get("pos", 0))
+        _save_dividers(d)
+    return {"ok": True}
+
+
+@app.patch("/api/dividers/{divider_id}")
+def divider_edit(divider_id: str, body: DividerBody):
+    with _dividers_lock:
+        d = _load_dividers()
+        for rows in d.values():
+            for r in rows:
+                if r.get("id") == divider_id:
+                    if body.title.strip():
+                        r["title"] = body.title.strip()[:40]
+                    if body.pos is not None:
+                        r["pos"] = max(0, body.pos)
+                    rows.sort(key=lambda x: x.get("pos", 0))
+                    _save_dividers(d)
+                    return {"ok": True}
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
+@app.delete("/api/dividers/{divider_id}")
+def divider_delete(divider_id: str):
+    with _dividers_lock:
+        d = _load_dividers()
+        for gid, rows in list(d.items()):
+            keep = [r for r in rows if r.get("id") != divider_id]
+            if len(keep) != len(rows):
+                d[gid] = keep
+                _save_dividers(d)
+                return {"ok": True}
+    return JSONResponse({"error": "not found"}, status_code=404)
 
 
 _ARCHIVED_PATH = Path.home() / ".ground-control" / "archived.json"
