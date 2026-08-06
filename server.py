@@ -6,6 +6,7 @@ desktop-app process first so history never forks).
 """
 import glob
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -296,6 +297,14 @@ def parse_turns(path: Path):
     # OFF the active chain (parent on-branch, itself unvisited) is a message
     # Phil really sent. The parent-in-seen guard keeps pre-compaction/old-branch
     # history out.
+    # A rewind (/rewind, esc-esc) abandons a branch: its head is ALSO a user node
+    # whose parent is on the active chain — indistinguishable from a queued
+    # mid-turn message by parentage alone. The tell is descendants: a queued
+    # message is a true DEAD END, while a rewound branch head still has the
+    # replies that followed it. Merging the latter resurrected rewound history
+    # into chat while the terminal correctly showed it gone.
+    has_children = {e.get("parentUuid") for e in lines if e.get("parentUuid")}
+
     extras = []
 
     def _add_extra(uuid, clean, images, ts, idx):
@@ -314,6 +323,7 @@ def parse_turns(path: Path):
     for i, e in enumerate(lines):
         if (e.get("type") == "user" and e.get("uuid")
                 and e["uuid"] not in seen
+                and e["uuid"] not in has_children      # rewound branch head, not a queued send
                 and not e.get("isSidechain")
                 and e.get("parentUuid") in seen):
             text = _msg_text(e)
@@ -1621,6 +1631,56 @@ def _event_cost(e: dict) -> float:
     return (e["in"] * p[0] + e["out"] * p[1] + e["cr"] * p[2] + e["cw"] * p[3]) / 1_000_000.0
 
 
+_SPAWN_CACHE = {}   # transcript path -> (mtime, (key, title)) | None
+
+
+def _spawn_origin(path: Path):
+    """Identify the AGENT that spawned a machine-run session, so the Usage list can
+    bucket its children under one row instead of hundreds of hex names.
+
+    Machine-spawned sessions (`claude -p` from a daemon, script, or cron) all open
+    with the SAME instruction prompt, so that prompt is the spawner's fingerprint.
+    Returns (key, title) or None for ordinary human sessions.
+
+    Title preference: the transcript's own ai-title (Claude's summary of the job,
+    e.g. "Monitor incoming text messages") — that reads better than any guess."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    hit = _SPAWN_CACHE.get(str(path))
+    if hit and hit[0] == st.st_mtime:
+        return hit[1]
+    first, title = None, None
+    try:
+        with open(path, "r", errors="ignore") as fh:
+            for i, line in enumerate(fh):
+                if i > 40:
+                    break
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("type") == "ai-title" and e.get("aiTitle"):
+                    title = str(e["aiTitle"])[:60]
+                if first is None and e.get("type") == "user" and not e.get("isSidechain"):
+                    c = (e.get("message") or {}).get("content")
+                    if isinstance(c, str) and c.strip():
+                        first = c.strip()
+                if first and title:
+                    break
+    except OSError:
+        return None
+    out = None
+    # A long, instruction-shaped opening prompt = a program's system prompt, not a
+    # human's first message. (Humans don't open with 600 chars of policy.)
+    if first and len(first) >= 600:
+        key = hashlib.sha1(first[:600].encode("utf-8", "replace")).hexdigest()[:12]
+        out = (key, title or (first[:40] + "…"))
+    _SPAWN_CACHE[str(path)] = (st.st_mtime, out)
+    return out
+
+
 @app.get("/api/activity")
 def activity(start: float = 0.0, end: float = 0.0):
     """What's running now + real per-session token/time/$ usage in a [start,end] window.
@@ -1712,9 +1772,34 @@ def activity(start: float = 0.0, end: float = 0.0):
             a["model"] = e["model"]  # last model seen in window
 
     sessions = []
+    # Bucket machine-spawned sessions under the agent that spawned them. Only
+    # sessions the app does NOT know by name are candidates — a real named
+    # session is always its own top-level row.
+    known = set(ezmap) | {s for s, r in recs_by_sid.items() if r.get("title")}
+    spawn_of, spawn_count = {}, {}
+    for sid in agg:
+        if sid in known:
+            continue
+        p = idx.get(sid)
+        o = _spawn_origin(p) if p is not None else None
+        if o:
+            spawn_of[sid] = o
+            spawn_count[o[0]] = spawn_count.get(o[0], 0) + 1
+    # ONE stable title per group: each child's ai-title is Claude's own summary of
+    # that run, so they differ slightly ("Monitor incoming messages" vs "Monitor
+    # Phil's text messages") — 34 variants for one fleet. The most common wins, so
+    # the bucket keeps a single steady name.
+    title_votes = {}
+    for sid, o in spawn_of.items():
+        title_votes.setdefault(o[0], {})
+        title_votes[o[0]][o[1]] = title_votes[o[0]].get(o[1], 0) + 1
+    group_title = {k: max(v.items(), key=lambda kv: kv[1])[0] for k, v in title_votes.items()}
     for a in agg.values():
         a["title"], a["project"] = _label(a["id"])
         a["activeMin"] = len(a.pop("_min"))
+        o = spawn_of.get(a["id"])
+        if o and spawn_count.get(o[0], 0) >= 3:   # 3+ siblings = a real fleet
+            a["group"], a["groupTitle"] = o[0], group_title.get(o[0], o[1])
         a["cost"] = round(a["cost"], 4)
         # A model switch we made via /model is newer than anything in the window until
         # the next reply lands — without this the Usage row kept showing the OLD model
