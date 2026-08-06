@@ -683,24 +683,31 @@ def _run_injection(session_id: str, cwd: str, text: str, resume: bool):
             _jobs[session_id] = {"status": "error", "error": str(e), "finished": time.time()}
 
 
-def _flush_restored_input(name: str):
-    """After an ESC interrupt, submit any message Claude Code restored into the
-    terminal's input line (queued mid-turn sends come back UNSENT). Detection is
-    strict: a line starting with ❯ that has text after it, sitting directly
-    under a horizontal rule (the composer box top). Dialog/menu ❯ pointers are
-    inside │-bordered boxes and never match."""
-    for _ in range(2):  # the interrupt redraw can lag; check twice
-        time.sleep(0.9)
+def _restored_input(name: str, tries: int = 4) -> str:
+    """Text Claude Code put BACK into the terminal's input line after an ESC —
+    i.e. a queued message that was never processed. Detection is strict: a line
+    starting with ❯ that has text after it, sitting directly under a horizontal
+    rule (the composer box top). Menu/dialog ❯ pointers live inside │-bordered
+    boxes and never match."""
+    for _ in range(tries):
+        time.sleep(0.55)
         try:
             lines = gc_ez._render_lines(name) or []
         except Exception:
-            return
+            return ""
         for i, ln in enumerate(lines):
             st = ln.strip()
             if st.startswith("❯") and st[1:].strip():
                 if i > 0 and lines[i - 1].lstrip().startswith("───"):
-                    gc_ez.send_input(name, "\r")
-                    return
+                    # Continuation rows: the composer wraps long messages.
+                    text = st[1:].strip()
+                    for nxt in lines[i + 1:]:
+                        t2 = nxt.strip()
+                        if not t2 or t2.startswith("───") or t2.startswith("⏵"):
+                            break
+                        text += " " + t2
+                    return text.strip()
+    return ""
 
 
 @app.post("/api/session/{project_dir}/{session_id}/stop")
@@ -714,15 +721,20 @@ def stop_session(project_dir: str, session_id: str):
     ez = ez_name_for(session_id)
     if gc_ez.is_alive(ez):
         gc_ez.send_input(ez, "\x1b")
-        # Claude Code restores queued (mid-turn) messages into the composer
-        # UNSENT on interrupt — in a terminal you'd press Enter yourself, but a
-        # chat-initiated ESC would strand them there forever (the stuck-QUEUED
-        # bug). Follow up: once the interrupt redraw lands, if text is sitting
-        # in the input line (❯ …, directly under the box's rule line — menus'
-        # ❯ pointers never are), press Enter for the user. An extra Enter on an
-        # empty composer is a no-op, so the worst case is harmless.
-        threading.Thread(target=_flush_restored_input, args=(ez,), daemon=True).start()
-        return {"ok": True, "stopped": True, "what": "terminal esc"}
+        # ESC IN CHAT === ESC IN THE TERMINAL. Claude Code restores a queued
+        # (never-processed) message into its input line unsent. We hand that
+        # text BACK to the app so it lands in the chat composer for editing —
+        # the message is "un-sent", exactly like the terminal — and clear the
+        # terminal's line (Ctrl-U) so the text lives in exactly one place.
+        # A message already being processed restores nothing: ESC just
+        # interrupts and the session waits, which is also the terminal's
+        # behavior. (We used to auto-press Enter here, which force-SENT a
+        # message the user was trying to pull back.)
+        restored = _restored_input(ez)
+        if restored:
+            gc_ez.send_input(ez, "\x15")   # kill-line: leave the composer empty
+        return {"ok": True, "stopped": True, "what": "terminal esc",
+                "restored": restored}
     # Owned session → interrupt the current turn without killing the process.
     if _sessions.is_owned_live(session_id):
         _sessions.stop(session_id)
