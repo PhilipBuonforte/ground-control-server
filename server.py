@@ -4208,7 +4208,11 @@ def _save_dividers(d: dict):
 class DividerBody(BaseModel):
     group_id: str = ""
     title: str = ""
-    pos: Optional[int] = None
+    # ANCHORED, not indexed: `after` is the session id this divider follows
+    # (null/"" = very top of the group). An index drifts the moment a session is
+    # inserted above it, and it gives drag-and-drop nothing to aim at — with an
+    # anchor, dropping a session directly above a divider just re-anchors it.
+    after: Optional[str] = None
 
 
 @app.get("/api/dividers")
@@ -4226,8 +4230,7 @@ def divider_add(body: DividerBody):
         d = _load_dividers()
         rows = d.setdefault(body.group_id, [])
         rows.append({"id": "dv-" + _uuid.uuid4().hex[:10], "title": title,
-                     "pos": max(0, body.pos if body.pos is not None else 0)})
-        rows.sort(key=lambda r: r.get("pos", 0))
+                     "after": (body.after or None)})
         _save_dividers(d)
     return {"ok": True}
 
@@ -4241,9 +4244,8 @@ def divider_edit(divider_id: str, body: DividerBody):
                 if r.get("id") == divider_id:
                     if body.title.strip():
                         r["title"] = body.title.strip()[:40]
-                    if body.pos is not None:
-                        r["pos"] = max(0, body.pos)
-                    rows.sort(key=lambda x: x.get("pos", 0))
+                    if body.after is not None:
+                        r["after"] = body.after or None
                     _save_dividers(d)
                     return {"ok": True}
     return JSONResponse({"error": "not found"}, status_code=404)
