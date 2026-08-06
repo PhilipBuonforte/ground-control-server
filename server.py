@@ -710,6 +710,56 @@ def _restored_input(name: str, tries: int = 4) -> str:
     return ""
 
 
+def _already_answered(path: Path, text: str) -> bool:
+    """Did this prompt actually get WORKED ON — i.e. produce assistant output?
+
+    Claude Code restores the input line on interrupt in two cases that look
+    identical on screen:
+      1. a prompt it never got to answer → Claude Code UN-SENDS it (also
+         removing it from the terminal view), so chat should hand it back.
+      2. a prompt it had already started answering → the reply is in the feed,
+         so handing the text back too would duplicate it.
+    The tiebreaker is an ASSISTANT REPLY under that user record — presence of
+    the record alone isn't enough: an un-sent prompt still leaves one behind
+    with nothing under it. Uses the cached line reader (a byte window is
+    useless here — single records can be megabytes of image data)."""
+    if not text:
+        return False
+    needle = " ".join(text.split())[:80].lower()
+    if not needle:
+        return False
+    try:
+        lines = _read_lines(path)[-600:]
+    except Exception:  # noqa: BLE001
+        return False
+    kids, hit_uuid = {}, None
+    for e in lines:
+        if e.get("parentUuid"):
+            kids.setdefault(e["parentUuid"], []).append(e)
+        if e.get("type") == "user" and not e.get("isSidechain"):
+            c = (e.get("message") or {}).get("content")
+            body = c if isinstance(c, str) else ""
+            if body and needle in " ".join(body.split()).lower():
+                hit_uuid = e.get("uuid")     # newest match wins
+    if not hit_uuid:
+        return False
+    seen, stack = set(), [hit_uuid]
+    while stack:
+        u = stack.pop()
+        for c in kids.get(u, []):
+            cu = c.get("uuid")
+            if cu and cu not in seen:
+                seen.add(cu)
+                stack.append(cu)
+            if c.get("type") == "assistant":
+                body = (c.get("message") or {}).get("content")
+                if isinstance(body, list) and any(
+                        isinstance(b, dict) and (b.get("text") or b.get("type") == "tool_use")
+                        for b in body):
+                    return True
+    return False
+
+
 @app.post("/api/session/{project_dir}/{session_id}/stop")
 def stop_session(project_dir: str, session_id: str):
     # EZ terminal session (the "brain") → interrupt the live turn by sending ESC
@@ -732,7 +782,17 @@ def stop_session(project_dir: str, session_id: str):
         # message the user was trying to pull back.)
         restored = _restored_input(ez)
         if restored:
-            gc_ez.send_input(ez, "\x15")   # kill-line: leave the composer empty
+            # ALWAYS clear the terminal's line — a leftover there would get
+            # concatenated onto the next message typed in from chat.
+            gc_ez.send_input(ez, "\x15")
+            eff = _effective_sid(project_dir, session_id)
+            tp = PROJECTS_DIR / project_dir / f"{eff}.jsonl"
+            if not tp.exists():
+                tp = PROJECTS_DIR / project_dir / f"{session_id}.jsonl"
+            # Processed already → the chat feed owns it; don't hand it back or
+            # it shows up twice (bubble in the feed AND text in the composer).
+            if tp.exists() and _already_answered(tp, restored):
+                restored = ""
         return {"ok": True, "stopped": True, "what": "terminal esc",
                 "restored": restored}
     # Owned session → interrupt the current turn without killing the process.
