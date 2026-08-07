@@ -58,8 +58,22 @@ def cmd_list(_):
     print("\nMessage one:  gc-agent send \"<agent>\" \"your question\"")
 
 
+def _whoami():
+    """This session's DISPLAY name — the one Phil sees and renames. Matched by
+    working folder, so a rename is picked up automatically. Falls back to the
+    folder name if the folder hosts several sessions (ambiguous)."""
+    try:
+        mine = [a for a in _get("/api/agents")["agents"]
+                if a.get("cwd") and os.path.samefile(a["cwd"], os.getcwd())]
+        if len(mine) == 1:
+            return mine[0]["name"]
+    except Exception:  # noqa: BLE001
+        pass
+    return os.path.basename(os.getcwd())
+
+
 def cmd_send(args):
-    sender = args.sender or os.path.basename(os.getcwd())
+    sender = args.sender or _whoami()
     r = _post("/api/agents/message", {"to": args.to, "sender": sender,
                                       "text": args.text, "hops": args.hops})
     if r.get("ok"):

@@ -4208,32 +4208,62 @@ def _agent_log(entry: dict):
         pass
 
 
-@app.get("/api/agents")
-def agents_directory():
-    """WHO IS OUT THERE. Every live session: its name (how you address it), the
-    folder it works in, and whether it's busy right now."""
-    ezmap = _load_ez_names()                       # sid -> friendly name
+def _agent_rows():
+    """Live sessions as peers. `name` is the DISPLAY name — what Phil sees in the
+    app and what he renames — because that's the name agents will use for each
+    other. `ez` is the transport handle underneath; renaming a session must not
+    change how it's addressed, which is exactly what happened when the directory
+    exposed the raw EZ handle ("GC Two Claude" long after it was renamed)."""
+    ezmap = _load_ez_names()                       # sid -> EZ handle
     recs = {r.get("cliSessionId"): r for r in _desktop_records().values()
             if r.get("cliSessionId")}
     try:
         live = set(gc_ez.list_sessions())
     except Exception:  # noqa: BLE001
         live = set()
-    out = []
-    for sid, name in ezmap.items():
-        if name not in live:
+    rows = []
+    for sid, ez in ezmap.items():
+        if ez not in live:
             continue
         r = recs.get(sid) or {}
-        out.append({
-            "name": name,
+        rows.append({
+            "name": (r.get("title") or ez),
+            "ez": ez,
             "id": sid,
             "cwd": r.get("cwd") or "",
             "project": Path(r.get("cwd") or "").name,
-            "title": r.get("title") or name,
-            "working": working_by_ez(name),
+            "title": r.get("title") or ez,
+            "working": working_by_ez(ez),
         })
-    out.sort(key=lambda a: a["name"].lower())
-    return {"agents": out, "count": len(out)}
+    rows.sort(key=lambda a: a["name"].lower())
+    return rows
+
+
+def _resolve_agent(who: str):
+    """Find a peer by display name OR EZ handle, case/punctuation-forgiving —
+    'GC: Ground Control', 'gc ground control' and 'GC Two Claude' all land."""
+    if not who:
+        return None
+    def norm(x):
+        return "".join(c for c in x.lower() if c.isalnum())
+    target = norm(who)
+    rows = _agent_rows()
+    for r in rows:                                  # exact display / ez
+        if who == r["name"] or who == r["ez"]:
+            return r
+    for r in rows:                                  # normalized
+        if target in (norm(r["name"]), norm(r["ez"])):
+            return r
+    hits = [r for r in rows if target and (target in norm(r["name"]) or target in norm(r["ez"]))]
+    return hits[0] if len(hits) == 1 else None
+
+
+@app.get("/api/agents")
+def agents_directory():
+    """WHO IS OUT THERE. Every live session: how to address it, the folder it
+    works in, and whether it's busy right now."""
+    rows = _agent_rows()
+    return {"agents": rows, "count": len(rows)}
 
 
 class AgentMessage(BaseModel):
@@ -4252,9 +4282,15 @@ def agent_message(body: AgentMessage):
     if body.hops >= _AGENT_MAX_HOPS:
         return JSONResponse({"error": f"hop limit ({_AGENT_MAX_HOPS}) reached — "
                                       "chain stopped to prevent a loop"}, status_code=429)
-    if not gc_ez.is_alive(to):
-        return JSONResponse({"error": f"'{to}' is not running — see /api/agents"},
+    target = _resolve_agent(to)
+    if target is None or not gc_ez.is_alive(target["ez"]):
+        return JSONResponse({"error": f"'{to}' is not running or not unique — see /api/agents"},
                             status_code=404)
+    to_ez, to_name = target["ez"], target["name"]
+    # The sender's CURRENT display name, so a rename is reflected immediately
+    # and the reply hint addresses something that actually resolves.
+    src = _resolve_agent(sender)
+    sender = (src or {}).get("name", sender)
     now = time.time()
     with _agentmsg_lock:
         _agent_sent[:] = [(t, s) for t, s in _agent_sent if now - t < 60]
@@ -4266,25 +4302,23 @@ def agent_message(body: AgentMessage):
     # Delivered as a clearly-marked prompt so the recipient knows it's a peer,
     # who it is, and exactly how to reply (with the hop count carried forward).
     note = (f"\U0001F4E8 Agent message from \"{sender or 'another session'}\"\n\n{text}\n\n"
-            f"(To reply: gc-agent send \"{sender}\" \"...\" --hops {body.hops + 1} — "
-            f"or ignore it if no reply is needed.)")
-    ok = gc_ez.send_input(to, note)
+            f"(To reply: ~/.local/bin/gc-agent send \"{sender}\" \"...\" "
+            f"--hops {body.hops + 1} — or ignore it if no reply is needed.)")
+    ok = gc_ez.send_input(to_ez, note)
     if ok:
         time.sleep(0.12)
-        ok = gc_ez.send_input(to, "\r")
-    _agent_log({"ts": now, "from": sender, "to": to, "text": text,
+        ok = gc_ez.send_input(to_ez, "\r")
+    _agent_log({"ts": now, "from": sender, "to": to_name, "text": text,
                 "hops": body.hops, "delivered": bool(ok)})
     # MAKE IT VISIBLE IN THE SIDEBAR. Without this an inbound agent message looks
     # like the session spontaneously started working — you can't tell it was
     # pinged, or by whom. The unread dot says "something arrived here"; the
     # Agents screen says who sent it.
-    if ok:
-        tsid = sid_for_ez(to)
-        if tsid:
-            mark_unread(tsid)
+    if ok and target.get("id"):
+        mark_unread(target["id"])
     if not ok:
         return JSONResponse({"error": "delivery failed"}, status_code=409)
-    return {"ok": True, "to": to, "hops": body.hops + 1}
+    return {"ok": True, "to": to_name, "hops": body.hops + 1}
 
 
 @app.get("/api/agents/messages")
