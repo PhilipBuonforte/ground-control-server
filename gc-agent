@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""gc-agent — find and talk to the other Claude sessions on this Mac.
+
+Every session is an expert in its own project. This is how they reach each
+other directly, instead of guessing or routing through the humans' /requests hub.
+
+  gc-agent list                        who's running, in which folder, busy or not
+  gc-agent send "<name>" "<message>"   message that session (it appears as a prompt)
+  gc-agent log                         recent agent-to-agent traffic (audit)
+
+Options for `send`:
+  --hops N     hop counter carried through a reply chain (stops runaway loops)
+  --from NAME  override the sender name (defaults to this session's folder name)
+
+Rules that keep this sane:
+  • say who you are and what you need — the recipient has no context on you
+  • one question, not a conversation; they're mid-task in their own project
+  • if you get a message needing no reply, DON'T reply (that's how loops start)
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("GC_BASE", "http://127.0.0.1:8130")
+
+
+def _get(path):
+    with urllib.request.urlopen(BASE + path, timeout=20) as r:
+        return json.load(r)
+
+
+def _post(path, body):
+    req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:  # noqa: BLE001
+            return {"error": f"HTTP {e.code}"}
+
+
+def cmd_list(_):
+    d = _get("/api/agents")
+    if not d["agents"]:
+        print("No other sessions are running.")
+        return
+    print(f"{'AGENT':26} {'PROJECT':24} STATUS")
+    for a in d["agents"]:
+        print(f"{a['name'][:25]:26} {a['project'][:23]:24} "
+              f"{'working' if a['working'] else 'idle'}")
+    print("\nMessage one:  gc-agent send \"<agent>\" \"your question\"")
+
+
+def cmd_send(args):
+    sender = args.sender or os.path.basename(os.getcwd())
+    r = _post("/api/agents/message", {"to": args.to, "sender": sender,
+                                      "text": args.text, "hops": args.hops})
+    if r.get("ok"):
+        print(f"delivered to {args.to}")
+    else:
+        print("not delivered:", r.get("error", r), file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_log(args):
+    for m in _get(f"/api/agents/messages?limit={args.limit}")["messages"]:
+        arrow = "->" if m.get("delivered") else "xx"
+        print(f"{m.get('from','?')} {arrow} {m.get('to','?')}: {m.get('text','')[:90]}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="gc-agent", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="who is running").set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("send", help="message another session")
+    s.add_argument("to")
+    s.add_argument("text")
+    s.add_argument("--hops", type=int, default=0)
+    s.add_argument("--from", dest="sender", default="")
+    s.set_defaults(fn=cmd_send)
+
+    lg = sub.add_parser("log", help="recent agent-to-agent traffic")
+    lg.add_argument("--limit", type=int, default=40)
+    lg.set_defaults(fn=cmd_log)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -4182,6 +4182,120 @@ def place_session(session_id: str, body: PlaceBody):
     return {"ok": True}
 
 
+# ---- Agent directory + agent-to-agent messaging ---------------------------
+# Sessions are experts in their own project. This lets them FIND each other
+# (who's running, in which folder, working on what) and talk directly, instead
+# of routing through the /requests hub (built for humans) or guessing.
+#
+# Guardrails, because two agents can ping-pong forever:
+#   • every delivery is logged and visible to Phil
+#   • per-sender + global rate limits
+#   • a reply to a reply to a reply gets cut off (hop budget)
+_AGENTMSG_PATH = Path.home() / ".ground-control" / "agent-messages.jsonl"
+_agentmsg_lock = threading.Lock()
+_agent_sent = []          # recent (ts, sender) for rate limiting
+_AGENT_RATE_PER_MIN = 8   # per sender
+_AGENT_GLOBAL_PER_MIN = 20
+_AGENT_MAX_HOPS = 4       # A→B→A→B then stop
+
+
+def _agent_log(entry: dict):
+    try:
+        _AGENTMSG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_AGENTMSG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+@app.get("/api/agents")
+def agents_directory():
+    """WHO IS OUT THERE. Every live session: its name (how you address it), the
+    folder it works in, and whether it's busy right now."""
+    ezmap = _load_ez_names()                       # sid -> friendly name
+    recs = {r.get("cliSessionId"): r for r in _desktop_records().values()
+            if r.get("cliSessionId")}
+    try:
+        live = set(gc_ez.list_sessions())
+    except Exception:  # noqa: BLE001
+        live = set()
+    out = []
+    for sid, name in ezmap.items():
+        if name not in live:
+            continue
+        r = recs.get(sid) or {}
+        out.append({
+            "name": name,
+            "id": sid,
+            "cwd": r.get("cwd") or "",
+            "project": Path(r.get("cwd") or "").name,
+            "title": r.get("title") or name,
+            "working": working_by_ez(name),
+        })
+    out.sort(key=lambda a: a["name"].lower())
+    return {"agents": out, "count": len(out)}
+
+
+class AgentMessage(BaseModel):
+    to: str = ""            # target agent NAME (from /api/agents)
+    sender: str = ""        # your own agent name
+    text: str = ""
+    hops: int = 0           # bumped by each reply in a chain
+
+
+@app.post("/api/agents/message")
+def agent_message(body: AgentMessage):
+    to, sender = (body.to or "").strip(), (body.sender or "").strip()
+    text = (body.text or "").strip()
+    if not to or not text:
+        return JSONResponse({"error": "to and text required"}, status_code=400)
+    if body.hops >= _AGENT_MAX_HOPS:
+        return JSONResponse({"error": f"hop limit ({_AGENT_MAX_HOPS}) reached — "
+                                      "chain stopped to prevent a loop"}, status_code=429)
+    if not gc_ez.is_alive(to):
+        return JSONResponse({"error": f"'{to}' is not running — see /api/agents"},
+                            status_code=404)
+    now = time.time()
+    with _agentmsg_lock:
+        _agent_sent[:] = [(t, s) for t, s in _agent_sent if now - t < 60]
+        if len(_agent_sent) >= _AGENT_GLOBAL_PER_MIN:
+            return JSONResponse({"error": "global agent-message rate limit"}, status_code=429)
+        if sum(1 for _, s in _agent_sent if s == sender) >= _AGENT_RATE_PER_MIN:
+            return JSONResponse({"error": "you are messaging too fast"}, status_code=429)
+        _agent_sent.append((now, sender))
+    # Delivered as a clearly-marked prompt so the recipient knows it's a peer,
+    # who it is, and exactly how to reply (with the hop count carried forward).
+    note = (f"\U0001F4E8 Agent message from \"{sender or 'another session'}\"\n\n{text}\n\n"
+            f"(To reply: gc-agent send \"{sender}\" \"...\" --hops {body.hops + 1} — "
+            f"or ignore it if no reply is needed.)")
+    ok = gc_ez.send_input(to, note)
+    if ok:
+        time.sleep(0.12)
+        ok = gc_ez.send_input(to, "\r")
+    _agent_log({"ts": now, "from": sender, "to": to, "text": text,
+                "hops": body.hops, "delivered": bool(ok)})
+    if not ok:
+        return JSONResponse({"error": "delivery failed"}, status_code=409)
+    return {"ok": True, "to": to, "hops": body.hops + 1}
+
+
+@app.get("/api/agents/messages")
+def agent_messages(limit: int = 100):
+    """Every agent-to-agent message, newest last — so this never happens in the
+    dark. Powers the app's audit view."""
+    try:
+        lines = _AGENTMSG_PATH.read_text().splitlines()[-max(1, min(limit, 500)):]
+    except OSError:
+        return {"messages": []}
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            pass
+    return {"messages": out}
+
+
 # ---- Dividers: subtle labelled separators INSIDE a group -------------------
 # Kept in OUR OWN file, never in the desktop app's config: that config gets
 # rewritten by the desktop app (it wiped Phil's groups twice), and unknown
