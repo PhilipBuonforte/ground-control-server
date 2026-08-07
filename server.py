@@ -4274,6 +4274,14 @@ def agent_message(body: AgentMessage):
         ok = gc_ez.send_input(to, "\r")
     _agent_log({"ts": now, "from": sender, "to": to, "text": text,
                 "hops": body.hops, "delivered": bool(ok)})
+    # MAKE IT VISIBLE IN THE SIDEBAR. Without this an inbound agent message looks
+    # like the session spontaneously started working — you can't tell it was
+    # pinged, or by whom. The unread dot says "something arrived here"; the
+    # Agents screen says who sent it.
+    if ok:
+        tsid = sid_for_ez(to)
+        if tsid:
+            mark_unread(tsid)
     if not ok:
         return JSONResponse({"error": "delivery failed"}, status_code=409)
     return {"ok": True, "to": to, "hops": body.hops + 1}
