@@ -112,10 +112,32 @@ def connect_client(name: str, cols: int = 80, rows: int = 40,
         return None
 
 
-def send_input(name: str, text: str) -> bool:
+# Bracketed-paste wrappers. A real terminal emits these around pasted text to tell
+# the app "this arrived as one block, not as keystrokes".
+_PASTE_START = "\x1b[200~"
+_PASTE_END = "\x1b[201~"
+
+
+def send_input(name: str, text: str, paste: bool = False) -> bool:
     """One-shot: type `text` into the EZ PTY WITHOUT disturbing its size (size 0,0
     tells the daemon to skip the resize). Used when the message view sends to a
     session whose brain is a live terminal.
+
+    `paste=True` wraps the text in BRACKETED PASTE markers, and any message the user
+    (or a peer agent) authored MUST use it. Without them Claude Code's Ink TUI applies
+    its own heuristic paste detection to a fast write, and a long message arrives
+    GUTTED — measured against a real Claude TUI on 2026-09-10: 2,421 bytes sent, 377
+    bytes received, only the LAST 9 of 60 markers. That is Phil's "my long messages get
+    cut off": what lands is the tail. With the markers, 12,016 bytes of a 12,016-byte
+    message arrived intact.
+
+    It also fixes multi-line pastes. A raw newline is Enter, so a 13-line block used to
+    submit 13 separate messages; inside paste markers it stays one message with its
+    newlines intact.
+
+    Do NOT set paste=True for control keys or single keystrokes (ESC, CR, ctrl-U, a
+    menu digit) — those must arrive as real key events, and Enter in particular has to
+    stay a SEPARATE raw write after the paste or the message is typed but never sent.
 
     Connects LIVE-ONLY (flag 0x04): the daemon must NOT replay its ring buffer at
     this throwaway client. With the old plain connect, a busy session's ~600KB
@@ -132,7 +154,14 @@ def send_input(name: str, text: str) -> bool:
             if s is None:
                 return False   # no socket = session gone; retrying won't help
             s.settimeout(3.0)
-            s.sendall(text.encode())
+            payload = text
+            if paste:
+                # Strip any end-marker inside the text, or it would close the paste
+                # early and the remainder would be interpreted as keystrokes.
+                payload = (_PASTE_START
+                           + text.replace(_PASTE_END, "").replace(_PASTE_START, "")
+                           + _PASTE_END)
+            s.sendall(payload.encode())
             # Stay connected and DRAIN briefly after sending: the daemon may be
             # mid-write to us (live bytes, or a legacy daemon's replay); reading
             # until quiet guarantees it can finish its write and process our

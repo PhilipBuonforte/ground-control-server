@@ -79,6 +79,9 @@ _sessions = SessionManager(CLAUDE_BIN, default_model=GC_MODEL,
 def _startup():
     threading.Thread(target=_alert_worker, daemon=True).start()
     threading.Thread(target=_terminal_work_warmer, daemon=True).start()
+    # Burn-rate + context watchdogs. Zero token cost; they text Phil before a
+    # runaway becomes a $150 surprise.
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 # ---------------------------------------------------------------- parsing
 
@@ -86,18 +89,41 @@ _parse_cache = {}  # path -> {mtime, size, offset, lines: [dict], partial: str}
 _cache_lock = threading.Lock()
 
 
+# A long-lived session's transcript grows without bound — the largest on this Mac
+# is 700MB. Parsing one from byte 0 decodes it to a UCS4 str, splitlines() copies
+# every line again, and json.loads keeps every entry in _parse_cache forever: the
+# server peaked at 64GB and held the GIL long enough that uvicorn stopped ACCEPTING
+# connections. The whole session list went blank and the apps could not reach the
+# server at all. Nothing that reads a transcript needs the middle of it, so a big
+# file is cold-started from its TAIL — the same trick last_message_ts already uses.
+_BIG_TRANSCRIPT = 8_000_000   # over this, never parse from byte 0
+_BOOT_TAIL = 4_000_000        # first sight of a big file: start this far from the end
+_MAX_LINES = 20_000           # retained entries per transcript, oldest dropped
+
+
 def _read_lines(path: Path):
-    """Incrementally parse a jsonl transcript, cached by offset."""
+    """Incrementally parse a jsonl transcript, cached by offset.
+
+    Bounded on both ends: an oversized file starts at `size - _BOOT_TAIL` (its
+    first parsed line is a fragment and is dropped), and the retained list is
+    capped at `_MAX_LINES`. Callers therefore see the RECENT conversation, never
+    necessarily the whole of it — every caller here scans from the end anyway."""
     st = path.stat()
     with _cache_lock:
         c = _parse_cache.get(str(path))
         if c and c["mtime"] == st.st_mtime and c["size"] == st.st_size:
             return c["lines"]
+    mid = False
     if c is None or st.st_size < c["size"]:
-        c = {"offset": 0, "lines": [], "partial": ""}
+        start = st.st_size - _BOOT_TAIL if st.st_size > _BIG_TRANSCRIPT else 0
+        mid = start > 0
+        c = {"offset": max(0, start), "lines": [], "partial": ""}
     with open(path, "rb") as f:
         f.seek(c["offset"])
+        if mid:
+            f.readline()      # partial line at the seek point — never parseable
         chunk = f.read()
+        end = f.tell()
     text = c["partial"] + chunk.decode("utf-8", errors="replace")
     new_partial = ""
     if text and not text.endswith("\n"):
@@ -112,11 +138,13 @@ def _read_lines(path: Path):
             lines.append(json.loads(raw))
         except json.JSONDecodeError:
             pass
+    if len(lines) > _MAX_LINES:
+        del lines[: len(lines) - _MAX_LINES]
     with _cache_lock:
         _parse_cache[str(path)] = {
             "mtime": st.st_mtime,
             "size": st.st_size,
-            "offset": c["offset"] + len(chunk),
+            "offset": end,
             "lines": lines,
             "partial": new_partial,
         }
@@ -145,6 +173,27 @@ def _msg_text(entry):
     if text.strip() in ("No response requested.", "No response requested"):
         return None
     return text
+
+
+def _as_text(value):
+    """Flatten a transcript field that is USUALLY a string but sometimes content blocks.
+
+    Claude Code writes a queued mid-turn message's `prompt` as a plain string — until
+    the message carries attachments, and then it becomes a content-block list
+    ([{"type":"text","text":...}, {"type":"image",...}]). `parse_turns` assumed the
+    string form and called .strip() on it, so ONE photo-bearing queued message threw
+    AttributeError and 500'd the whole chat endpoint: the session's chat screen went
+    blank, with no partial render and nothing in the stdout log (2026-08-27, MPB: App,
+    a 962MB transcript).
+
+    Never index a transcript field by assumed type. Returns "" for anything unusable."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [b.get("text", "") for b in value
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
 
 
 def _is_turn(entry):
@@ -338,7 +387,9 @@ def parse_turns(path: Path):
             att = e.get("attachment") or {}
             if (att.get("type") == "queued_command"
                     and (att.get("origin") or {}).get("kind") == "human"):
-                prompt = (att.get("prompt") or "").strip()
+                # NOT `(att.get("prompt") or "").strip()` — with attachments this is a
+                # content-block LIST, and .strip() on it blanked the whole chat screen.
+                prompt = _as_text(att.get("prompt")).strip()
                 if prompt and not _is_harness_noise(prompt):
                     clean, images = _extract_images(prompt)
                     if clean or images:
@@ -433,6 +484,306 @@ def _subagent_running(sid: str) -> bool:
     return e["count"] > 0
 
 
+# ---- Background jobs: what a session left RUNNING while it sits at a prompt -----
+# The gap Phil hit: a session kicks off a 40-minute device build and a Monitor, then
+# parks at an idle prompt waiting to be woken. The dot says idle — correctly, the
+# terminal IS quiet — so from the outside it is indistinguishable from "finished,
+# waiting on you" and from "wedged". He had no way to know whether he was waiting for
+# a reason. So we show the jobs themselves.
+#
+# SOURCE IS THE OS, not the screen and not a heuristic: a background job is a real
+# child process of the session's own `claude` process, which we find by the
+# `--session-id <sid>` in its argv. A process either exists or it doesn't, so this
+# cannot manufacture a phantom the way mtime/transcript inference does. It is kept
+# strictly OUT of is_working() — jobs are a SEPARATE channel the UI shows BESIDE the
+# working dot. Terminal is still the only truth for "working"; this only answers the
+# different question "is anything of mine still running?".
+_JOBS_TTL = 3.0                     # one `ps` for ALL sessions, reused for 3s
+_jobs_cache = {"ts": 0.0, "jobs": {}}
+_desc_cache = {}                    # sid -> (transcript_mtime, [(cmd, desc, kind)])
+_JOB_NOISE = re.compile(
+    r"^(cd|export|source|pkill|sleep|set|unset|eval|builtin|true|shift|PATH=|[A-Z_]+=\S*$)\b")
+
+
+def _etime_secs(et: str) -> int:
+    """ps ELAPSED ([[dd-]hh:]mm:ss) -> seconds."""
+    try:
+        days, _, rest = et.partition("-")
+        if not rest:
+            rest, days = days, "0"
+        parts = [int(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return int(days) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except Exception:                                             # noqa: BLE001
+        return 0
+
+
+def _job_headline(cmd: str) -> str:
+    """The one line of a shell-wrapped command a human would recognize.
+
+    Claude Code wraps every Bash call in a snapshot-source + `eval '<real command>'`
+    envelope, so the raw argv is 600 chars of boilerplate. Pull the payload and take
+    the first segment that isn't plumbing (cd/export/pkill/sleep/redirections)."""
+    m = re.search(r"eval '(.*)' < /dev/null", cmd, re.S)
+    body = (m.group(1) if m else cmd).replace("\\012", "\n")
+    for line in body.split("\n"):
+        for seg in re.split(r"&&|\|\||;", line):
+            t = re.sub(r"\s*[0-9]?>[>&]?\s*\S+", "", seg).strip()   # drop redirections
+            t = re.sub(r"\s+", " ", t)
+            if t and not _JOB_NOISE.match(t):
+                return t[:120]
+    return re.sub(r"\s+", " ", body.strip())[:120] or "background command"
+
+
+def _job_descriptions(sid: str):
+    """(command, description, kind) for every background start this session declared.
+
+    Claude writes a human `description` for each Bash/Monitor call ("Run the E2E
+    flow"), which is what turns an unreadable `until grep -aqE …` into something Phil
+    can read. Scanned INCREMENTALLY (remember the byte offset, parse only what's new)
+    — an active session's transcript is megabytes and changes every second, so a
+    re-read-the-tail cache would either miss old jobs (a 40-minute build's start
+    record scrolls far out of any tail window) or re-read the whole file per poll."""
+    path = next(PROJECTS_DIR.glob(f"*/{sid}.jsonl"), None)
+    if not path:
+        return []
+    st = _desc_cache.setdefault(sid, {"pos": 0, "rows": []})
+    try:
+        size = path.stat().st_size
+        if size < st["pos"]:                     # truncated/rotated → rescan
+            st["pos"], st["rows"] = 0, []
+        if size > st["pos"]:
+            with open(path, "r", errors="replace") as f:
+                f.seek(st["pos"])
+                chunk = f.read()
+                st["pos"] = f.tell()
+        else:
+            return st["rows"]
+    except OSError:
+        return st["rows"]
+
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("type") == "tool_use" and o.get("name") in ("Bash", "Monitor"):
+                inp = o.get("input") or {}
+                cmd, desc = inp.get("command") or "", inp.get("description") or ""
+                if cmd and (o["name"] == "Monitor" or inp.get("run_in_background")):
+                    st["rows"].append({"cmd": cmd, "desc": desc, "out": "",
+                                       "kind": "monitor" if o["name"] == "Monitor" else "shell",
+                                       "uid": o.get("id", "")})
+            # The tool_result names the task's own output file ("Output is being
+            # written to: …"). Pair it back onto the start by tool_use_id.
+            if o.get("type") == "tool_result":
+                c = o.get("content")
+                txt = c if isinstance(c, str) else json.dumps(c)
+                m = re.search(r"Output is being written to:\s*(\S+)", txt or "")
+                if m:
+                    uid = o.get("tool_use_id", "")
+                    for r in reversed(st["rows"]):
+                        if r["uid"] and r["uid"] == uid:
+                            r["out"] = m.group(1)
+                            break
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    for ln in chunk.splitlines():
+        if '"tool_use"' not in ln and '"tool_result"' not in ln:
+            continue
+        try:
+            walk(json.loads(ln))
+        except Exception:                                         # noqa: BLE001
+            continue
+    st["rows"] = st["rows"][-300:]
+    return st["rows"]
+
+
+def _norm_cmd(t: str) -> str:
+    """Compare-able form of a command line. Quotes are STRIPPED because the shell
+    wrapper re-quotes the payload — a declared `--predicate 'x CONTAINS "y"'` reaches
+    ps as `--predicate '"'"'x CONTAINS "y"'"'"'`, which matched nothing."""
+    t = t.replace("\\012", " ").replace("\n", " ").replace("'", "").replace('"', "")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _bg_children_all() -> dict:
+    """sid -> [(pid, elapsed_secs, argv)] for every live child of that session's claude.
+
+    One `ps` for the whole machine, reused for _JOBS_TTL. The session's claude process
+    is found by the `--session-id <sid>` it was launched with, which survives /clear
+    (the process keeps its original argv) — so this key is the session's STABLE id."""
+    now = time.time()
+    if now - _jobs_cache["ts"] < _JOBS_TTL:
+        return _jobs_cache["jobs"]
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,etime=,%cpu=,command="],
+                             capture_output=True, text=True, timeout=6).stdout
+    except Exception:                                             # noqa: BLE001
+        return _jobs_cache["jobs"]
+    kids, claude_pid, procs = {}, {}, {}
+    for ln in out.splitlines():
+        p = ln.split(None, 4)
+        if len(p) < 5:
+            continue
+        pid, ppid, et, cpu, cmd = p
+        kids.setdefault(ppid, []).append(pid)
+        procs[pid] = {"ppid": ppid, "et": et, "cpu": cpu, "cmd": cmd}
+        # BOTH launch shapes: a new session gets `--session-id`, but a woken/resumed
+        # one gets `--resume` — and most live sessions are resumed. Matching only the
+        # first made every resumed session look like it had no background jobs at all.
+        m = re.search(r"--(?:session-id|resume)\s+([0-9a-f-]{36})", cmd)
+        if m and cmd.split()[0].endswith("/claude"):
+            claude_pid[m.group(1)] = pid
+    children = {}
+    for sid, pid in claude_pid.items():
+        rows = [(int(c), _etime_secs(procs[c]["et"]), procs[c]["cmd"])
+                for c in kids.get(pid, []) if c in procs]
+        if rows:
+            children[sid] = rows
+    _jobs_cache.update(ts=now, jobs=children, kids=kids, procs=procs)
+    return children
+
+
+def _descendants(pid: str) -> list:
+    """Every process under `pid` (the job's own tree). A background build's real
+    activity is in here — the shell itself just waits."""
+    kids, procs = _jobs_cache.get("kids") or {}, _jobs_cache.get("procs") or {}
+    out, stack = [], list(kids.get(str(pid), []))
+    while stack:
+        c = stack.pop()
+        if c in procs:
+            out.append(c)
+            stack.extend(kids.get(c, []))
+        if len(out) > 400:
+            break
+    return out
+
+
+def _jobs_moving(sid: str) -> bool:
+    """Is any background job of this session actually MOVING right now?
+
+    Phil's rule: "something in the session is running, so keep the spinner spinning."
+    The guard is `isMoving`, not mere existence — a job whose log hasn't grown in 45s
+    and whose process tree is burning no CPU is parked (a Monitor asleep between
+    polls, a stream sitting idle), and spinning forever on a parked process is exactly
+    the stuck-spinner phantom §1 exists to prevent. Alive-and-doing-something spins;
+    alive-and-waiting does not — and either way the ⚙ badge still shows it's there."""
+    try:
+        for j in bg_jobs(sid):
+            if (j.get("logAge") is not None and j["logAge"] < 45) or (j.get("cpu") or 0) > 1.0:
+                return True
+    except Exception:                                             # noqa: BLE001
+        pass
+    return False
+
+
+def _job_pulse(pid: int, cmd: str) -> dict:
+    """Proof of life for one job: CPU across its whole tree, and what it is running
+    RIGHT NOW. An age alone ("1h 42m") says a process exists, not that it's doing
+    anything — which is exactly the ambiguity Phil hit."""
+    procs = _jobs_cache.get("procs") or {}
+    tree = [str(pid)] + _descendants(pid)
+    cpu = 0.0
+    busiest, best = None, -1.0
+    for p in tree:
+        info = procs.get(p)
+        if not info:
+            continue
+        try:
+            c = float(info["cpu"])
+        except ValueError:
+            c = 0.0
+        cpu += c
+        if p != str(pid) and c > best:
+            best, busiest = c, info["cmd"]
+    running = _job_headline(busiest) if busiest else _job_headline(cmd)
+    return {"cpu": round(cpu, 1), "running": running[:90], "procs": len(tree)}
+
+
+_LOG_TOKEN = re.compile(r"(/[^\s\'\"<>|;)]+\.(?:log|out|txt))")
+
+
+def _job_log(cmd: str, task_out: str = "") -> dict:
+    """The file to TAIL to see what this job is doing.
+
+    Order matters. A background command's own task file is empty whenever the command
+    redirects itself (`… > /tmp/dvir_phone.log 2>&1`), which is the norm for the long
+    builds — so a write-redirect target wins when it has content. A Monitor writes
+    nothing at all; the honest thing to show is the log it is WATCHING, which is the
+    file Phil would tail by hand anyway."""
+    body = _norm_cmd(cmd)
+    cands = []
+    for m in re.finditer(r"(?:^|\s)[0-9]?>>?\s*(\S+)", body):
+        t = m.group(1)
+        if t and not t.startswith("&") and "/dev/null" not in t:
+            cands.append((t, "output"))
+    for t in _LOG_TOKEN.findall(body):
+        if all(t != c[0] for c in cands):
+            cands.append((t, "watching"))
+    if task_out:
+        cands.insert(0, (task_out, "output"))
+    for path, kind in cands:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if st.st_size <= 0 and kind == "output" and len(cands) > 1:
+            continue                      # empty task file, but a real log exists
+        return {"log": path, "logKind": kind, "logBytes": st.st_size,
+                "logAge": max(0, int(time.time() - st.st_mtime))}
+    return {}
+
+
+def bg_jobs(sid: str, alt: str = "") -> list:
+    """[{pid, label, kind, elapsed}] — the background work this session left running.
+
+    `alt` is the session's CURRENT conversation id after a /clear: the process is still
+    keyed by the original sid, but jobs it declared since the clear are recorded in the
+    rotated transcript, so both are scanned for labels."""
+    rows = _bg_children_all().get(sid)
+    if not rows:
+        return []
+    descs = list(_job_descriptions(sid))
+    if alt and alt != sid:
+        descs += _job_descriptions(alt)
+    out = []
+    for cpid, elapsed, cmd in rows:
+        norm = _norm_cmd(cmd)
+        hit = None
+        for d in reversed(descs):
+            dcmd, desc, dkind = d["cmd"], d["desc"], d["kind"]
+            # Match on the FULL command, not a prefix: two Monitors differing only in
+            # their log file share the first 40 chars and would collapse into one label.
+            full = _norm_cmd(dcmd)
+            key = full[:300]
+            # BOTH directions: Claude wraps a background command in an `eval '<cmd>'`
+            # zsh envelope, but that wrapper often exits and leaves the real process
+            # (e.g. `xcrun simctl … log stream`) reparented onto claude with its BARE
+            # argv — then the live child is a substring of the declared command.
+            if (len(key) > 12 and key in norm) or (len(norm) > 25 and norm[:200] in full):
+                hit = (desc, dkind, d.get("out") or "")
+                break
+        if not hit:
+            continue        # a child claude never declared as background = orphan, not a job
+        job = {"pid": cpid, "label": hit[0] or _job_headline(cmd), "kind": hit[1],
+               "elapsed": elapsed, "cmd": _job_headline(cmd)}
+        job.update(_job_pulse(cpid, cmd))
+        job.update(_job_log(cmd, hit[2]))
+        out.append(job)
+    return sorted(out, key=lambda r: -r["elapsed"])
+
+
+def bg_jobs_all() -> dict:
+    """sid -> jobs, for every session that has any (the session-list path)."""
+    return {sid: js for sid in _bg_children_all()
+            if (js := bg_jobs(sid))}
+
+
+
+
 def is_working(sid: str, live: bool, mtime: float, job_running: bool, path=None,
                terminal_snapshot: bool = False) -> bool:
     # TERMINAL IS THE BRAIN. If this session runs as a live EZ terminal, its own
@@ -450,8 +801,9 @@ def is_working(sid: str, live: bool, mtime: float, job_running: bool, path=None,
         # that the app can't tell from real work. A cold cache (w is None) reads as
         # idle here; the 0.6s warmer fills it in and the next poll corrects it. This
         # is what keeps the side dot, chat banner, and terminal banner in lockstep.
-        # OR a background subagent is in flight (main prompt idle but real work running).
-        return bool(w) or _subagent_running(sid)
+        # OR real background work is in flight (main prompt idle, work still running):
+        # a hook-reported subagent, or a background shell/Monitor that is MOVING.
+        return bool(w) or _subagent_running(sid) or _jobs_moving(sid)
     # A Ground-Control-OWNED session knows its state authoritatively: busy is set
     # the instant a message hits stdin and cleared on the matching stream-json
     # `result` — the SAME truth the terminal spinner reports, from the same stream.
@@ -506,6 +858,27 @@ def _work_progress(path: Path):
     return {"seconds": max(0, int(time.time() - start)), "tokens": tokens}
 
 
+def _read_head(path: Path, nbytes: int = 512_000):
+    """Parsed entries from the first `nbytes` of a transcript (last line dropped —
+    it is a fragment). Only for the few facts that live at the START of a file."""
+    try:
+        with open(path, "rb") as f:
+            buf = f.read(nbytes)
+    except OSError:
+        return []
+    raw_lines = buf.decode("utf-8", errors="replace").split("\n")[:-1]
+    out = []
+    for raw in raw_lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw))
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
 def session_meta(path: Path):
     """Cheap metadata for the list view."""
     lines = _read_lines(path)
@@ -517,6 +890,17 @@ def session_meta(path: Path):
             title = _msg_text(e)
         if title and cwd:
             break
+    if title is None:
+        # An oversized transcript is parsed from its tail, so the FIRST user
+        # message — the one the title comes from — was never loaded. Read just
+        # the head of the file for it rather than the whole thing.
+        for e in _read_head(path):
+            if cwd is None and e.get("cwd"):
+                cwd = e["cwd"]
+            if e.get("type") == "user" and not e.get("isSidechain"):
+                title = _msg_text(e)
+                if title:
+                    break
     for e in reversed(lines):
         if _is_turn(e):
             t = _msg_text(e)
@@ -571,6 +955,117 @@ _jobs = {}  # session_id -> {status, started, result, error}
 _jobs_lock = threading.Lock()
 
 # unread alert tracking: which sessions fired an alert Phil hasn't viewed yet
+SEEN_PATH = Path.home() / ".ground-control" / "seen.json"
+_seen_lock = threading.Lock()
+
+
+# ---- Last REAL message time (never the file's mtime) -----------------------------
+# A transcript's FILE mtime moves for reasons that have nothing to do with the
+# conversation: file-history snapshots, permission-mode records, hook summaries. Using
+# it as "this session said something" produced phantom unread — LX: Prosp-X claimed it
+# had replied 29 minutes ago when its last real message was 4.7 DAYS old, and Phil got
+# "waiting on you" on sessions nobody had touched. (The invariants warn about exactly
+# this class of mtime inference; read-state fell into it.)
+#
+# So: the newest timestamp on an actual assistant/user record. Scanned INCREMENTALLY —
+# remember the byte offset, parse only what's new — because these files reach tens of
+# MB and every poll would otherwise re-read them all.
+_msg_ts_cache = {}          # path -> {"pos": int, "ts": float}
+_MSG_TAIL_BOOT = 512_000    # first sight: last 0.5MB is plenty to find a recent message
+
+
+def last_message_ts(path, fallback: float) -> float:
+    from datetime import datetime          # module-local, like the other helpers here
+    key = str(path)
+    st = _msg_ts_cache.get(key)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return fallback
+    if st is None:
+        st = {"pos": max(0, size - _MSG_TAIL_BOOT), "ts": 0.0}
+        _msg_ts_cache[key] = st
+    elif size < st["pos"]:                       # truncated / rotated
+        st["pos"], st["ts"] = 0, 0.0
+    if size > st["pos"]:
+        try:
+            with open(path, "r", errors="replace") as f:
+                f.seek(st["pos"])
+                chunk = f.read()
+                st["pos"] = f.tell()
+        except OSError:
+            return st["ts"] or fallback
+        for ln in chunk.splitlines():
+            if '"timestamp"' not in ln:
+                continue
+            try:
+                e = json.loads(ln)
+            except Exception:                                     # noqa: BLE001
+                continue
+            # ONLY real conversation records. Not system/hook/snapshot/meta rows —
+            # those are the ones that were moving the clock without anything happening.
+            if e.get("type") not in ("assistant", "user") or e.get("isMeta"):
+                continue
+            t = e.get("timestamp") or ""
+            try:
+                ts = datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if ts > st["ts"]:
+                st["ts"] = ts
+    return st["ts"] or fallback
+
+
+def _load_seen() -> dict:
+    """sid -> the transcript mtime this session had when it was last LOOKED AT.
+
+    One shared high-water mark for every device: opening a session on the phone must
+    clear "waiting on you" on the Mac too. Kept next to the other durable GC state
+    (NOT in the repo dir) so a redeploy can't wipe it."""
+    if SEEN_PATH.exists():
+        try:
+            with open(SEEN_PATH) as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def baseline_seen(pairs) -> dict:
+    """Give never-before-seen sessions a mark at their CURRENT mtime.
+
+    Without this every session reads as unseen on a fresh state file, so the whole list
+    claims "waiting on you" — the exact noise that made the phrase meaningless. History
+    before we started tracking is not news."""
+    d = _load_seen()
+    missing = {sid: mt for sid, mt in pairs if sid not in d}
+    if not missing:
+        return d
+    with _seen_lock:
+        d = _load_seen()
+        d.update({k: v for k, v in missing.items() if k not in d})
+        SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SEEN_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, SEEN_PATH)
+    return d
+
+
+def mark_seen(session_id: str, ts: float = 0.0) -> None:
+    with _seen_lock:
+        d = _load_seen()
+        val = float(ts) if ts else time.time()
+        if val <= float(d.get(session_id, 0)):
+            return                       # never move the mark backwards
+        d[session_id] = val
+        SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SEEN_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, SEEN_PATH)       # atomic — same lesson as settings.json
+
+
 UNREADS_PATH = Path(__file__).parent / "unreads.json"
 _unreads_lock = threading.Lock()
 
@@ -1088,8 +1583,13 @@ def _recent_chats(limit: int = 40):
             out.append({"cid": cid, "title": title, "is_group": is_group,
                         "last_text": txt, "ts": _apple_ts(date)})
         c.close()
-    except Exception:
-        pass
+    except Exception as e:                                        # noqa: BLE001
+        # NEVER silent. An empty Text Assistant inbox looked like "no messages"
+        # when the real cause was the Messages database being unreadable — the
+        # screen said "Watching your messages" while it could see nothing.
+        print(f"[imsg] CANNOT READ {_CHATDB}: {type(e).__name__}: {e} — "
+              f"the Text Assistant inbox will be EMPTY. Usually Full Disk Access "
+              f"for the server process.", flush=True)
     if out:
         _chats_cache.update({"ts": time.time(), "data": out})
     return out
@@ -1626,6 +2126,16 @@ def _model_family(m: str) -> str:
     return "other"
 
 
+# $ per MILLION tokens. Cache WRITE is the expensive one — every cold resume re-writes
+# the whole conversation into the cache, which is how a one-line team message can cost
+# more than a day of real work.
+_RATES = {
+    "opus":   {"in": 15.0, "out": 75.0, "cw": 18.75, "cr": 1.50},
+    "sonnet": {"in":  3.0, "out": 15.0, "cw":  3.75, "cr": 0.30},
+    "haiku":  {"in":  0.80, "out": 4.0, "cw":  1.00, "cr": 0.08},
+}
+
+
 def _scan_usage_file(path: Path, title: str, project: str):
     """Incrementally extract per-message token usage from one transcript."""
     from datetime import datetime
@@ -1636,7 +2146,10 @@ def _scan_usage_file(path: Path, title: str, project: str):
         if c and c["size"] == st.st_size:
             return c["events"]
         if c is None or st.st_size < c["size"]:
-            c = {"offset": 0, "events": []}
+            # First sight of a huge transcript: start from the last 8MB rather than
+            # parsing 40MB+ of history nobody asked for.
+            start = max(0, st.st_size - 8_000_000)
+            c = {"offset": start, "events": []}
     events = list(c["events"])
     with open(path, "rb") as f:
         f.seek(c["offset"])
@@ -1663,14 +2176,244 @@ def _scan_usage_file(path: Path, title: str, project: str):
         cr = u.get("cache_read_input_tokens", 0)
         cw = u.get("cache_creation_input_tokens", 0)
         total = inp + out + cr + cw
+        r = _RATES.get(fam, _RATES["opus"])
+        cost = (inp / 1e6 * r["in"] + out / 1e6 * r["out"]
+                + cw / 1e6 * r["cw"] + cr / 1e6 * r["cr"])
         events.append({
             "ts": epoch, "model": fam, "session": title, "project": project,
+            "sid": path.stem,
             "in": inp, "out": out, "cr": cr, "cw": cw, "total": total,
             "weighted": total * _MODEL_WEIGHT.get(fam, 1.0),
+            "cost": round(cost, 4),
         })
     with _usage_lock:
         _usage_cache[str(path)] = {"size": st.st_size, "offset": c["offset"] + len(chunk), "events": events}
     return events
+
+
+
+# ---- Burn-rate + context watchdogs -----------------------------------------------
+# Two cheap guards, both costing ZERO tokens: they read numbers the server already
+# has and text Phil. The expensive lesson behind them is 2026-08-21, when a runaway
+# burned a week's allowance and $150 of credits before anyone noticed.
+_PACE_PATH = Path.home() / ".ground-control" / "watchdog.json"
+
+
+def _watchdog_state() -> dict:
+    if _PACE_PATH.exists():
+        try:
+            return json.load(open(_PACE_PATH))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _watchdog_save(d: dict) -> None:
+    try:
+        _PACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _PACE_PATH.with_suffix(".json.tmp")
+        json.dump(d, open(tmp, "w"))
+        os.replace(tmp, _PACE_PATH)
+    except OSError:
+        pass
+
+
+def _text_phil(msg: str) -> bool:
+    """Send Phil an iMessage. Costs nothing — no model involved."""
+    num = (_settings().get("call_number") or "").strip()
+    script = Path.home() / ".claude/skills/send-text/send_imessage.sh"
+    if not num or not script.exists():
+        return False
+    try:
+        subprocess.run([str(script), num, msg], capture_output=True, timeout=45)
+        return True
+    except Exception:                                             # noqa: BLE001
+        return False
+
+
+def _pace_check():
+    """Warn the FIRST time weekly usage runs ahead of an even burn.
+
+    'Even burn' = the share of the week that has elapsed. 40% of the week gone
+    should mean ~40% of the allowance used; being at 55% means running out on
+    Thursday. One text per threshold per week — never a nag."""
+    try:
+        s = usage_summary()
+    except Exception:                                             # noqa: BLE001
+        return
+    pct = float(s.get("week_pct") or 0)
+    try:
+        from datetime import datetime as _dt
+        reset = _dt.fromisoformat(str(s.get("week_resets")).replace("Z", "+00:00")).timestamp()
+    except Exception:                                             # noqa: BLE001
+        return
+    start = reset - 7 * 86400
+    elapsed_pct = max(0.0, min(100.0, (time.time() - start) / (7 * 86400) * 100))
+    ahead = pct - elapsed_pct
+    st = _watchdog_state()
+    key = f"pace-{int(start)}"                     # per plan-week
+    hit = st.get(key, 0)
+    # Escalating thresholds so one bad morning texts once, not hourly.
+    for level in (30, 20, 10):
+        if ahead >= level and hit < level:
+            when = "Thu" if elapsed_pct < 50 else "the weekend"
+            _text_phil(
+                f"⚠️ Ground Control: you're at {pct:.0f}% of this week's usage but only "
+                f"{elapsed_pct:.0f}% through the week — {ahead:.0f} points ahead of an even burn. "
+                f"At this rate the allowance runs out around {when}.")
+            st[key] = level
+            _watchdog_save(st)
+            print(f"[watchdog] pace alert sent: {pct:.0f}% used / {elapsed_pct:.0f}% elapsed", flush=True)
+            break
+
+
+_CTX_WARN = 50          # percent of the context window
+
+
+def _context_check():
+    """Flag any live session working above 50% context.
+
+    Big context is what actually costs money: every message re-caches the whole
+    thing, so a session at 80% costs several times what the same work costs at
+    20%. This only WARNS — it never restarts a session by itself, because a
+    session mid-task has state that only Phil should decide to discard."""
+    st = _watchdog_state()
+    idx = _transcript_index()
+    over = []
+    for name in gc_ez.list_sessions():
+        sid = sid_for_ez(name) or name
+        path = idx.get(sid)
+        if not path:
+            continue
+        try:
+            info = _ctx_for_path(path)
+        except Exception:                                         # noqa: BLE001
+            continue
+        pct = float(info.get("pct") or 0)
+        if pct >= _CTX_WARN:
+            title, _ = _session_display(sid)
+            over.append((pct, title or name, sid))
+    over.sort(reverse=True)
+    _WATCH_CACHE["context"] = [{"pct": round(p, 1), "title": t, "sid": s} for p, t, s in over]
+    fresh = [o for o in over if st.get(f"ctx-{o[2]}", 0) < int(o[0] // 10) * 10]
+    if fresh:
+        lines = "\n".join(f"  • {t} — {p:.0f}% context" for p, t, _ in fresh[:4])
+        _text_phil(f"Ground Control: {len(fresh)} session(s) past {_CTX_WARN}% context. "
+                   f"Every message now re-caches all of it.\n{lines}\n"
+                   f"Wrap them up and start fresh when you get a chance.")
+        for p, _, sid in fresh:
+            st[f"ctx-{sid}"] = int(p // 10) * 10
+        _watchdog_save(st)
+
+
+_WATCH_CACHE = {"context": []}
+
+
+@app.get("/api/context-warnings")
+def context_warnings():
+    """Sessions currently over the context threshold (for the app to surface)."""
+    return {"threshold": _CTX_WARN, "sessions": _WATCH_CACHE.get("context", [])}
+
+
+def _watchdog_loop():
+    while True:
+        try:
+            _pace_check()
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[watchdog] pace error: {e}", flush=True)
+        try:
+            _context_check()
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[watchdog] context error: {e}", flush=True)
+        time.sleep(600)
+
+
+@app.get("/api/usage-breakdown")
+def usage_breakdown(window: str = "24h"):
+    """Per-session usage expressed the way the PLAN works, not in raw tokens.
+
+    Phil is on a $200 Max plan, so the number that means something is "what share
+    of my weekly allowance did this session eat" — not "3.4 million tokens", which
+    tells him nothing. Anthropic reports one figure: week_pct (e.g. 11%). We know
+    every session's weighted tokens for that same week, so the ratio between them
+    converts tokens into percent-of-plan, and the parts sum to the whole.
+
+    Dollars are reported too, but they only MATTER once the plan allowance is gone
+    and usage starts drawing on credits."""
+    secs = {"1h": 3600, "today": 86400, "24h": 86400, "7d": 7 * 86400}.get(window, 86400)
+    now = time.time()
+    week_mode = window in ("week", "7d")
+    summary = usage_summary()
+    week_pct = float(summary.get("week_pct") or 0)
+    try:
+        from datetime import datetime as _dt
+        wk_reset = _dt.fromisoformat(str(summary.get("week_resets")).replace("Z", "+00:00")).timestamp()
+    except Exception:                                             # noqa: BLE001
+        wk_reset = now + 7 * 86400
+    week_start = wk_reset - 7 * 86400
+
+    ev = usage(days=8)["events"]
+    # Current names, so a renamed session stops showing its ancient auto-title.
+    recs = _desktop_records()
+    title_by_sid = {r.get("cliSessionId"): (r.get("title") or "").strip()
+                    for r in recs.values() if r.get("cliSessionId")}
+
+    week_weighted = sum(e["weighted"] for e in ev if e["ts"] >= week_start) or 1
+    # "This week" means SINCE THE RESET, not "the last 7 days" — otherwise the token
+    # column counts usage from last week's allowance while the % column doesn't, and
+    # rows show 282M tokens next to 0.00%.
+    start = week_start if week_mode else now - secs
+    rows = {}
+    for e in ev:
+        if e["ts"] < start:
+            continue
+        # Anything before the weekly reset belongs to LAST week's allowance.
+        in_week = e["ts"] >= week_start
+        k = e.get("sid") or e["session"]
+        r = rows.setdefault(k, {"sid": k, "title": "", "project": e.get("project", ""),
+                                "tokens": 0, "weighted": 0.0, "cost": 0.0, "last": 0})
+        r["tokens"] += e["total"]
+        r["weighted"] += e["weighted"]
+        r["week_weighted"] = r.get("week_weighted", 0) + (e["weighted"] if in_week else 0)
+        r["cost"] += e.get("cost", 0)
+        r["last"] = max(r["last"], e["ts"])
+        if not r["title"]:
+            r["title"] = title_by_sid.get(k) or e["session"]
+    out = []
+    for r in rows.values():
+        r["title"] = title_by_sid.get(r["sid"]) or r["title"] or "Untitled"
+        # Share of the WEEKLY allowance this session is responsible for.
+        r["pct_week"] = round(r.get("week_weighted", 0) / week_weighted * week_pct, 2)
+        r["cost"] = round(r["cost"], 2)
+        out.append(r)
+    out.sort(key=lambda r: -r["weighted"])
+    # Roll the long tail into one row. Dozens of sub-1% side-transcripts (subagent
+    # files, scratch dirs) made the list unreadable and buried the sessions that
+    # actually matter.
+    big = [r for r in out if r["pct_week"] >= 0.05 or r["cost"] >= 1.0]
+    tail = [r for r in out if r not in big]
+    if len(tail) > 1:
+        big.append({"sid": "_other", "title": f"Everything else ({len(tail)} small sessions)",
+                    "project": "", "tokens": sum(r["tokens"] for r in tail),
+                    "weighted": sum(r["weighted"] for r in tail),
+                    "cost": round(sum(r["cost"] for r in tail), 2),
+                    "pct_week": round(sum(r["pct_week"] for r in tail), 2),
+                    "last": max((r["last"] for r in tail), default=0)})
+        out = big
+    return {
+        "window": window,
+        "sessions": out,
+        "totals": {
+            "tokens": sum(r["tokens"] for r in out),
+            "pct_week": round(sum(r["pct_week"] for r in out), 2),
+            "cost": round(sum(r["cost"] for r in out), 2),
+        },
+        "plan": {"week_pct": week_pct, "week_resets": summary.get("week_resets"),
+                 "five_pct": summary.get("five_pct"), "five_resets": summary.get("five_resets"),
+                 "credits_used": summary.get("credits_used"),
+                 "credits_balance": summary.get("credits_balance"),
+                 "overage_on": summary.get("overage_on")},
+    }
 
 
 @app.get("/api/usage")
@@ -1692,9 +2435,31 @@ def usage(days: int = 30):
                     events.append(e)
         except OSError:
             continue
+    # Everything else on this machine: bridge runs, cron runs, plain-terminal
+    # sessions. They spend real money and had no way to appear here.
+    owned = {r.get("cliSessionId") for r in recs.values()}
+    for sid, path in idx.items():
+        if sid in owned:
+            continue
+        # Cheap pre-filter: a transcript untouched since the cutoff CANNOT contain
+        # events in the window. Without this the endpoint parsed every transcript on
+        # the machine (hundreds of MB) and hung for minutes.
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        project = path.parent.name.replace("-Users-philipbuonforte-claude-workspace-", "").strip("-") or "unknown folder"
+        try:
+            for e in _scan_usage_file(path, f"{project} (outside GC)", project):
+                if e["ts"] >= cutoff:
+                    e["external"] = True
+                    events.append(e)
+        except OSError:
+            continue
     events.sort(key=lambda e: e["ts"])
     return {"events": events, "now": time.time(),
-            "weights": _MODEL_WEIGHT}
+            "weights": _MODEL_WEIGHT, "rates": _RATES}
 
 
 def _event_cost(e: dict) -> float:
@@ -1886,6 +2651,17 @@ def activity(start: float = 0.0, end: float = 0.0):
         # showed usage with a blank context. Computing it here means it's always there.
         p = idx.get(a["id"])
         if p is not None:
+            # /clear starts a NEW transcript; read that one or this row reports the
+            # context of the conversation the user just threw away (same rule
+            # /api/context-all follows).
+            try:
+                eff = _effective_sid(p.parent.name, a["id"])
+                if eff != a["id"]:
+                    p2 = p.parent / f"{eff}.jsonl"
+                    if p2.exists():
+                        p = p2
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 info = _ctx_for_path(p)
                 a["ctxPct"] = info.get("pct", 0)
@@ -2190,6 +2966,73 @@ def _ctx_for_path(path: Path) -> dict:
             "model": _model_family(model)}
 
 
+# Measured on a freshly /cleared DVIR session (2026-08-21): the floor was 124,584
+# tokens, of which the CLAUDE.md chain accounted for ~44,700. The remainder is the
+# system prompt, tool definitions, MCP server schemas and the skills listing — the
+# same for every session on this machine, so it is a constant here.
+_FLOOR_BASELINE = 80_000
+
+
+_FLOOR_CACHE: dict[str, int] = {}   # path -> measured floor (a file's HEAD never changes)
+
+
+def _measured_floor(path: Path) -> int:
+    """The REAL floor, read from the transcript's FIRST assistant usage.
+
+    That request carried exactly what the session reloads before any conversation
+    exists — system prompt, tool definitions, MCP schemas, the skills listing and
+    the whole CLAUDE.md chain — so it is a MEASUREMENT, not an estimate. The old
+    `_context_floor` guess (a constant plus `bytes // 4` per CLAUDE.md) could and
+    did overshoot the measured context, drawing a floor TALLER than the session's
+    actual usage — which is impossible and read as a broken meter.
+
+    Returns 0 when the head holds no assistant usage yet; the caller falls back to
+    the estimate. Cached by path: a transcript is append-only, so its head is
+    immutable."""
+    key = str(path)
+    hit = _FLOOR_CACHE.get(key)
+    if hit is not None:
+        return hit
+    val = 0
+    for e in _read_head(path, 256_000):
+        msg = e.get("message") or {}
+        if msg.get("role") == "assistant" and msg.get("usage"):
+            u = msg["usage"]
+            val = ((u.get("input_tokens") or 0)
+                   + (u.get("cache_read_input_tokens") or 0)
+                   + (u.get("cache_creation_input_tokens") or 0))
+            break
+    if val:
+        _FLOOR_CACHE[key] = val
+    return val
+
+
+def _context_floor(cwd: str) -> int:
+    """Tokens a session reloads before its first message.
+
+    This is why /clear does NOT drop a session to 0%: the conversation is gone but
+    the standing instructions are re-read every time. A project whose CLAUDE.md is
+    huge can never start small, so trimming those files is worth more than any
+    amount of compacting."""
+    total = _FLOOR_BASELINE
+    try:
+        seen = set()
+        p = Path(cwd).resolve() if cwd else None
+        # CLAUDE.md is loaded for the folder and every ancestor up to home.
+        while p and p != p.parent and str(p).startswith(str(Path.home())):
+            f = p / "CLAUDE.md"
+            if f.exists() and f not in seen:
+                seen.add(f)
+                total += f.stat().st_size // 4
+            p = p.parent
+        g = Path.home() / ".claude" / "CLAUDE.md"
+        if g.exists():
+            total += g.stat().st_size // 4
+    except OSError:
+        pass
+    return total
+
+
 @app.get("/api/context-all")
 def context_all(limit: int = 30):
     """Per-session context fullness — powers the 'Context by session' list in the
@@ -2218,15 +3061,30 @@ def context_all(limit: int = 30):
                   reverse=True)[:max(1, min(limit, 100))]
     out = []
     for sid, (r, path) in rows:
+        # /clear starts a NEW transcript; read that one or the ring reports the
+        # conversation the user just threw away.
+        eff = _effective_sid(path.parent.name, sid)
+        if eff != sid:
+            p2 = path.parent / f"{eff}.jsonl"
+            if p2.exists():
+                path = p2
         try:
             info = _ctx_for_path(path)
         except Exception:  # noqa: BLE001
             continue
         if info.get("context_tokens", 0) <= 0:
             continue
+        # Measured floor first; the cwd estimate only as a fallback. Then CLAMP:
+        # a floor can never exceed the context actually loaded, so a stale estimate
+        # can no longer draw a floor bar taller than the current usage.
+        fl = _measured_floor(path) or _context_floor(r.get("cwd") or "")
+        fl = min(fl, info.get("context_tokens", 0))
         out.append({"id": sid, "dir": path.parent.name,
                     "title": (r.get("title") or "Untitled")[:60],
-                    "project": Path(r.get("cwd") or "").name, **info})
+                    "project": Path(r.get("cwd") or "").name,
+                    "floor_tokens": fl,
+                    "floor_pct": round(fl / max(1, info.get("window") or 200000) * 100, 1),
+                    **info})
     out.sort(key=lambda x: x.get("pct", 0), reverse=True)
     return out
 
@@ -2303,11 +3161,41 @@ def alert_flow_page():
     return FileResponse(STATIC_DIR / "alert-flow.html")
 
 
+@app.get("/linkx-workflow")
+def linkx_workflow_page():
+    """Diagram of the Link-X agentic dev workflow (agents / GitHub / CI / server)."""
+    return FileResponse(STATIC_DIR / "linkx-workflow.html")
+
+
+@app.get("/linkx-pipeline")
+def linkx_pipeline_page():
+    """Catch-up brief on Scott's AI dev pipeline in the link-x repo."""
+    return FileResponse(STATIC_DIR / "linkx-pipeline.html")
+
+
+@app.get("/linkx-proposal")
+def linkx_proposal_page():
+    """Phil's proposed ticket-to-PR flow, for review with Scott."""
+    return FileResponse(STATIC_DIR / "linkx-proposal.html")
+
+
 @app.get("/how-it-works")
 def how_it_works_page():
     """Plain-English explainer of the whole architecture (brain / windows / tunnel).
     Linked from Settings on both apps, and shareable to anyone."""
     return FileResponse(STATIC_DIR / "how-it-works.html")
+
+
+class SeenBody(BaseModel):
+    mtime: float = 0.0
+
+
+@app.post("/api/seen/{sid}")
+def seen_session(sid: str, body: SeenBody = None):
+    """Mark a session read up to `mtime` (default now). Called when a chat is opened or
+    polled on ANY device — that's what makes read-state shared instead of per-phone."""
+    mark_seen(sid, (body.mtime if body else 0.0))
+    return {"ok": True}
 
 
 @app.post("/api/ack/{sid}")
@@ -2316,6 +3204,7 @@ def ack_session(sid: str):
     call stop, WITHOUT navigating away and back. Lets the app 'acknowledge in place'
     (click the session you're already on, or an Acknowledge button)."""
     clear_unread(sid, reason="ack-button")
+    mark_seen(sid)          # acknowledging IS looking at it — keep the two in step
     return {"ok": True}
 
 
@@ -2352,7 +3241,43 @@ def work_state(name: str):
     _, label = gc_ez.work_status(name)
     if working and not label:
         label = "Background agent…"
-    return {"working": working, "label": label}
+    # Jobs ride along on the SAME poll (no extra request) but stay a SEPARATE field —
+    # never folded into `working`, which remains pure terminal output-activity.
+    sid = sid_for_ez(name) or name
+    return {"working": working, "label": label, "jobs": bg_jobs(sid)}
+
+
+@app.get("/api/job/{session_id}/{pid}/tail")
+def job_tail(session_id: str, pid: int, n: int = 14000, alt: str = ""):
+    """Open ONE background job and watch it.
+
+    "3 jobs running · 1h 42m" says something exists; it does not say it is alive.
+    Claude Code's own job manager is worse — it reports `running · No output
+    available`, because a command that redirects itself writes nothing to the task
+    file and a Monitor writes nothing at all. So this returns the three things that
+    actually settle it: the log the job is writing (or, for a Monitor, the log it is
+    watching), how long ago that file last grew, and what the job's process tree is
+    executing right this second.
+
+    The path is resolved SERVER-side from the job's own command — never taken from the
+    client, which would be an arbitrary-file-read."""
+    jobs = bg_jobs(session_id, alt=alt)
+    job = next((j for j in jobs if j["pid"] == pid), None)
+    if not job:
+        return {"ok": False, "gone": True, "text": "",
+                "note": "This job has finished — it is no longer running."}
+    text, path = "", job.get("log") or ""
+    if path:
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - max(1000, min(n, 200_000))))
+                text = f.read().decode("utf-8", "replace")
+            if "\n" in text:
+                text = text.split("\n", 1)[1]      # drop the partial first line
+        except OSError as e:
+            text = f"(couldn't read {path}: {e})"
+    return {"ok": True, **job, "text": text}
 
 
 @app.get("/terminal")
@@ -3061,6 +3986,8 @@ def list_sessions():
         ez_live = set()
 
     gc_archived = _archived_set()
+    alljobs = bg_jobs_all()          # one `ps` for the whole list, 3s cache
+    seenmap = _load_seen()
 
     def build_session(local_id):
         r = recs.get(local_id)
@@ -3080,7 +4007,10 @@ def list_sessions():
         if path is not None:
             try:
                 _, preview, _ = session_meta(path)
-                mtime = path.stat().st_mtime
+                # The LAST REAL MESSAGE, never the file's mtime — metadata writes
+                # (snapshots, permission-mode, hook summaries) move the file constantly
+                # and were being read as "this session just replied to you".
+                mtime = last_message_ts(path, path.stat().st_mtime)
             except OSError:
                 return None
             dir_name = path.parent.name
@@ -3113,7 +4043,22 @@ def list_sessions():
             # the CLIENT, timed by the client's OWN clock — never a cross-machine timestamp
             # comparison (that clock-skew mistake made the spinner vanish on the phone).
             "busy": working_by_ez(ezmap.get(sid, sid)),
+            # Background jobs this session started and left running. A session can be
+            # idle (terminal quiet) and still have real work in flight — the row shows
+            # this as its own marker so "parked, waiting on its own build" is
+            # distinguishable from "done, waiting on you".
+            "jobs": len(alljobs.get(sid, ())),
+            # How many are MOVING. The badge tints accent when real work is in flight
+            # and stays gray for parked debris (a 2-hour-old log stream at 0% CPU), so
+            # the side menu never implies "still working on your task" when it isn't.
+            "jobsMoving": sum(1 for j in alljobs.get(sid, ())
+                              if (j.get("logAge") is not None and j["logAge"] < 45)
+                              or (j.get("cpu") or 0) > 1.0),
             "unread": sid in unreads,
+            # Has this session produced output since it was last OPENED (on ANY device)?
+            # This is what earns the row's "waiting on you" — computed here, once, so the
+            # phone and the Mac can never disagree about what's been read.
+            "unseen": mtime > float(seenmap.get(sid, 0)) + 1,
         }
 
     unreads = _load_unreads()
@@ -3162,6 +4107,12 @@ def list_sessions():
     # Only the synthetic Ungrouped bucket hides when empty (guarded above).
     # Keep the icon badge honest: prune any unread whose session isn't shown here.
     reconcile_unreads({s["id"] for g in groups for s in g["sessions"]})
+    # First sighting of a session establishes its read-mark, so a fresh state file
+    # doesn't declare every session "waiting on you". Writes only when new ids appear.
+    fresh = baseline_seen([(s["id"], s["mtime"]) for g in groups for s in g["sessions"]])
+    for g in groups:
+        for s in g["sessions"]:
+            s["unseen"] = s["mtime"] > float(fresh.get(s["id"], 0)) + 1
     return {"groups": groups}
 
 
@@ -3244,7 +4195,10 @@ def get_session(project_dir: str, session_id: str, limit: int = 80):
     turns = parse_turns(path)
     with _jobs_lock:
         job = _jobs.get(session_id, {})
-    mtime = path.stat().st_mtime
+    # Same rule as the session list: the chat header's "last reply Xm ago" and the
+    # read-mark it posts must both come from the last REAL message, or chat and list
+    # disagree and the read-mark gets set to a metadata write.
+    mtime = last_message_ts(path, path.stat().st_mtime)
     live = session_id in live_sessions()
     # Actively-viewed session → read the terminal live (snapshot) so busy tracks
     # the terminal instantly, e.g. clears the moment STOP quiets it.
@@ -3296,6 +4250,9 @@ def get_session(project_dir: str, session_id: str, limit: int = 80):
         "total": len(turns),
         "live": live,
         "busy": busy,
+        # Same separate channel as /api/work: what this session left running. Rides the
+        # poll chat already makes, so the strip costs no extra request.
+        "jobs": bg_jobs(session_id, alt=eff),
         "waiting": waiting,
         "waitingQuestion": waiting_question,
         "work": work,
@@ -3316,7 +4273,7 @@ def type_into_terminal(project_dir: str, session_id: str, body: TypeBody):
     ez = ez_name_for(session_id)
     if not gc_ez.is_alive(ez):
         return JSONResponse({"ok": False, "error": "no live terminal"}, status_code=400)
-    gc_ez.send_input(ez, body.text)
+    gc_ez.send_input(ez, body.text, paste=True)
     return {"ok": True}
 
 
@@ -3594,7 +4551,7 @@ def _wake_ez_and_send(session_id: str, text: str):
         return
     # Type the text, THEN Enter as a separate keystroke (a single fast write is
     # treated as a paste, so the CR lands as a literal newline, not a submit).
-    if gc_ez.send_input(name, text):
+    if gc_ez.send_input(name, text, paste=True):
         time.sleep(0.12)
         gc_ez.send_input(name, "\r")
 
@@ -3809,7 +4766,7 @@ def send_message(project_dir: str, session_id: str, body: SendBody):
         # paste, so the trailing CR lands as a literal newline in the input box
         # instead of submitting — the message just sits there until you press
         # Enter yourself. Splitting it = the CR registers as a real submit.
-        ok = gc_ez.send_input(ez, text)
+        ok = gc_ez.send_input(ez, text, paste=True)
         if ok:
             time.sleep(0.12)
             ok = gc_ez.send_input(ez, "\r")
@@ -4304,7 +5261,7 @@ def agent_message(body: AgentMessage):
     note = (f"\U0001F4E8 Agent message from \"{sender or 'another session'}\"\n\n{text}\n\n"
             f"(To reply: ~/.local/bin/gc-agent send \"{sender}\" \"...\" "
             f"--hops {body.hops + 1} — or ignore it if no reply is needed.)")
-    ok = gc_ez.send_input(to_ez, note)
+    ok = gc_ez.send_input(to_ez, note, paste=True)
     if ok:
         time.sleep(0.12)
         ok = gc_ez.send_input(to_ez, "\r")
@@ -4653,7 +5610,7 @@ def new_session(body: NewSessionBody):
         # paste to Claude's composer — the trailing \r becomes a newline IN the
         # message instead of submitting it (the message sat unsubmitted in the
         # composer). The normal send path (session send) already does it this way.
-        gc_ez.send_input(ez, text)
+        gc_ez.send_input(ez, text, paste=True)
         time.sleep(0.3)
         before = _norm(gc_ez.snapshot(ez, 100, 40))
         gc_ez.send_input(ez, "\r")
@@ -5229,13 +6186,33 @@ def notify(body: NotifyBody):
 SETTINGS_PATH = Path(__file__).parent / "settings.json"
 
 
+_settings_lock = threading.Lock()
+
+
 def _settings():
     if SETTINGS_PATH.exists():
         try:
-            return json.load(open(SETTINGS_PATH))
-        except json.JSONDecodeError:
-            pass
+            with open(SETTINGS_PATH) as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            # NEVER swallow this silently. A corrupt settings.json reads as "{}", which
+            # silently disables call escalation (call_delay defaults to 0) and resets
+            # the alert delay — Phil sat 10 minutes on an unacknowledged session and no
+            # phone call ever came, with nothing in the log to say why.
+            print(f"[settings] CORRUPT {SETTINGS_PATH}: {e} — using defaults, "
+                  f"call escalation is OFF until this is repaired", flush=True)
     return {}
+
+
+def _save_settings(s: dict) -> None:
+    """Write settings ATOMICALLY (temp file + os.replace) under a lock."""
+    with _settings_lock:
+        tmp = SETTINGS_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(s, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SETTINGS_PATH)
 
 
 def alert_delay() -> int:
@@ -5280,7 +6257,7 @@ def set_settings(body: SettingsBody):
         s["call_delay"] = max(0, min(7200, body.call_delay))
     if body.call_number:
         s["call_number"] = "" if body.call_number == "-" else body.call_number.strip()
-    json.dump(s, open(SETTINGS_PATH, "w"))
+    _save_settings(s)
     return {"ok": True, "alert_delay": s.get("alert_delay", 60),
             "repeat_alert": s.get("repeat_alert", 0),
             "always_alert": bool(s.get("always_alert", False)),
@@ -5296,7 +6273,7 @@ class MuteBody(BaseModel):
 def set_mute(body: MuteBody):
     s = _settings()
     s["mute_until"] = time.time() + max(0, min(1440, body.minutes)) * 60 if body.minutes > 0 else 0
-    json.dump(s, open(SETTINGS_PATH, "w"))
+    _save_settings(s)
     remaining = max(0, int(float(s["mute_until"]) - time.time()))
     return {"ok": True, "mute_remaining": remaining}
 _pending = {}     # session_id -> {fire_at, sig, title, body, dir}
@@ -5746,10 +6723,43 @@ def _place_call(number: str, message: str) -> bool:
         r = httpx.post(url, headers=headers, json=payload, timeout=20)
         ok = r.status_code in (200, 201)
         print(f"[call] bland {number} -> {r.status_code} {r.text[:160]}", flush=True)
+        if not ok:
+            _report_call_failure(r.status_code, r.text)
         return ok
     except Exception as e:  # noqa: BLE001
         print(f"[call] error calling {number}: {e}", flush=True)
+        _report_call_failure(0, str(e))
         return False
+
+
+_call_fail_notified = {"sig": "", "ts": 0.0}
+
+
+def _report_call_failure(status: int, body: str) -> None:
+    """Tell Phil, on his phone, that the CALL escalation is broken.
+
+    Silence here is the worst possible failure: the call exists precisely for the case
+    where he is not looking at the app, so a dead escalation looks exactly like "nothing
+    needed me". Deduped by reason so a broken account buzzes once an hour, not per try."""
+    reason = "Unknown error"
+    low = (body or "").lower()
+    if "insufficient balance" in low:
+        reason = "Bland account is out of credit — top it up to restore call alerts"
+    elif "rate limit" in low:
+        reason = "Bland rate limit hit — call alerts are being throttled"
+    elif status == 401 or "unauthor" in low:
+        reason = "Bland API key rejected — call alerts are off"
+    elif status:
+        reason = f"Call provider returned {status}"
+    now = time.time()
+    if _call_fail_notified["sig"] == reason and now - _call_fail_notified["ts"] < 3600:
+        return
+    _call_fail_notified.update(sig=reason, ts=now)
+    try:
+        send_apns("⚠️ Phone-call alerts are NOT working", reason, "", "")
+        send_push("⚠️ Phone-call alerts are NOT working", reason, "", "")
+    except Exception:                                             # noqa: BLE001
+        pass
 
 
 def _call_check():
