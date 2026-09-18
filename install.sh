@@ -186,7 +186,7 @@ else
 fi
 echo ""
 echo "  Next steps:"
-echo "  1. iPhone app  → TestFlight: TESTFLIGHT_LINK_HERE"
+echo "  1. iPhone app  → TestFlight: https://testflight.apple.com/join/AgWRZhPJ"
 echo "  2. The Mac app just opened → paste your server address → done."
 echo ""
 echo "  To update everything later: re-run this same command."

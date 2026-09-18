@@ -25,7 +25,7 @@ alert hooks. About a minute. When it finishes it shows your server address.
 
 - Install Tailscale (free) on your **Mac and iPhone**, signed into the **same
   account** on both: https://tailscale.com/download
-- iPhone app: TestFlight → TESTFLIGHT_LINK_HERE — paste your server address.
+- iPhone app: TestFlight → https://testflight.apple.com/join/AgWRZhPJ — paste your server address.
 
 **Updates are automatic**: the Mac app shows an "Update available → Install" banner
 (one click updates the app AND the server); the iPhone updates through TestFlight.
