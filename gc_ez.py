@@ -43,8 +43,29 @@ def list_sessions() -> list[str]:
         return []
 
 
-def start(name: str, cwd: str, command: list[str]) -> None:
-    """Spawn an EZ daemon running `command` (detached). No-op if already alive."""
+def last_error(name: str) -> str:
+    """The tail of why a session's daemon died, or "" if it left nothing.
+
+    Pairs with the daemon writing stderr to its own log instead of /dev/null. The
+    caller turns this into a message a human reads, rather than a blank screen."""
+    try:
+        with open(ez.error_log_path(name), "r", errors="replace") as fh:
+            txt = fh.read()[-2000:].strip()
+    except OSError:
+        return ""
+    # The interesting part is the last traceback, not the whole history.
+    marker = "Traceback (most recent call last)"
+    if marker in txt:
+        txt = txt[txt.rindex(marker):]
+    return txt
+
+
+def start(name: str, cwd: str, command: list[str]) -> bool:
+    """Spawn an EZ daemon running `command` (detached). No-op if already alive.
+
+    Returns True only when the session is actually ALIVE afterwards. It used to
+    return None unconditionally, so a daemon that died on startup was reported as
+    success and the user got an empty app with no error (2026-09-17)."""
     if is_alive(name):
         return
     os.makedirs(ez.SOCKET_DIR, exist_ok=True)
@@ -58,12 +79,14 @@ def start(name: str, cwd: str, command: list[str]) -> None:
     subprocess.Popen([sys.executable, "-c", code], cwd=cwd,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
-    # wait briefly for the socket to appear
+    # Wait for the socket. Its ABSENCE is the failure signal — the daemon writes its
+    # pid first and binds second, so "pid but no socket" means it died in between.
     sp = socket_path(name)
-    for _ in range(40):
+    for _ in range(80):
         if os.path.exists(sp):
             break
         time.sleep(0.05)
+    return is_alive(name)
 
 
 def kill(name: str) -> None:

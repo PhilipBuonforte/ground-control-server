@@ -44,6 +44,12 @@ def is_session_alive(name):
 # DAEMON MODE — runs in background, manages PTY + clients
 # ============================================================
 
+def error_log_path(name):
+    """Where a daemon writes why it died. Read by the server when a session fails to
+    come up, so the reason reaches the user instead of /dev/null."""
+    return os.path.join(SOCKET_DIR, "%s.err" % name)
+
+
 def daemon_main(name, command):
     """Fork to background and manage a PTY session."""
     os.makedirs(SOCKET_DIR, exist_ok=True)
@@ -68,11 +74,29 @@ def daemon_main(name, command):
     if os.fork() > 0:
         os._exit(0)
 
-    # Redirect stdio
+    # Redirect stdio. stdin goes to /dev/null, but stdout/stderr go to a per-session
+    # LOG FILE, never /dev/null.
+    #
+    # This line used to send all three to /dev/null, and it cost four hours on
+    # 2026-09-17: a new user's sessions died at birth and there was not one byte of
+    # explanation anywhere on his machine. The daemon writes its pid BEFORE it binds
+    # its socket, so a death here leaves a .pid, no .sock, and silence — which looks
+    # exactly like "the app is broken". Everything that can actually fail (bind, PTY
+    # allocation, exec of the command) happens AFTER this point, so redirecting to
+    # /dev/null is redirecting precisely the output that matters.
     devnull = os.open(os.devnull, os.O_RDWR)
     os.dup2(devnull, 0)
-    os.dup2(devnull, 1)
-    os.dup2(devnull, 2)
+    try:
+        _err = os.open(error_log_path(name),
+                       os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(_err, 1)
+        os.dup2(_err, 2)
+        sys.stderr.write("\n=== %s: daemon starting %s ===\ncommand: %r\ncwd: %s\n"
+                         % (name, time.strftime("%Y-%m-%d %H:%M:%S"), command, os.getcwd()))
+        sys.stderr.flush()
+    except OSError:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
 
     # Create PTY
     master_fd, slave_fd = pty.openpty()
@@ -135,6 +159,21 @@ def daemon_main(name, command):
     sync = _SyncCoalescer(lambda b: os.write(master_fd, b))
 
     def cleanup():
+        # Before tearing the session down, record what the command actually PRINTED.
+        # When a session dies at birth, this is the only place Claude's own words
+        # survive — its stderr goes to the PTY, not to our log, so without this the
+        # user is told "it failed" with no idea why (the 2026-09-17 debug).
+        try:
+            tail = bytes(output_buffer[-4000:]).decode("utf-8", "replace")
+            tail = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07", "", tail)
+            tail = "\n".join(l.rstrip() for l in tail.splitlines() if l.strip())
+            if tail:
+                sys.stderr.write("--- last output from the session ---\n%s\n" % tail[-2000:])
+            sys.stderr.write("=== session '%s' ended %s ===\n"
+                             % (name, time.strftime("%Y-%m-%d %H:%M:%S")))
+            sys.stderr.flush()
+        except Exception:                                          # noqa: BLE001
+            pass
         server.close()
         for c in clients:
             try: c['sock'].close()

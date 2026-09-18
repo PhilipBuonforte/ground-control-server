@@ -184,10 +184,70 @@ else
   echo "  Once Tailscale is signed in on this Mac, re-run the installer and it"
   echo "  will print your address (looks like https://your-mac.your-tailnet.ts.net)."
 fi
+# ---- SELF-TEST -------------------------------------------------------------
+# Actually create a session and confirm it lives, then remove it. Without this the
+# installer printed "Setup complete!" on a machine where sessions could never start,
+# and the user found out hours later staring at an empty app with no error anywhere
+# (2026-09-17). An installer that cannot prove it works has not finished.
+# gc-doctor: one command that dumps everything a helper needs. Installed next to the
+# server and symlinked onto PATH when we can, so "run gc-doctor and paste it" replaces
+# an evening of back-and-forth.
+if [ -f "$DIR/gc-doctor" ]; then
+  cp "$DIR/gc-doctor" "$INSTALL_DIR/gc-doctor" && chmod +x "$INSTALL_DIR/gc-doctor"
+  if [ -w /usr/local/bin ] || mkdir -p /usr/local/bin 2>/dev/null; then
+    ln -sf "$INSTALL_DIR/gc-doctor" /usr/local/bin/gc-doctor 2>/dev/null \
+      && ok "Diagnostics installed — run: gc-doctor" \
+      || ok "Diagnostics installed — run: ~/.ground-control/gc-doctor"
+  else
+    ok "Diagnostics installed — run: ~/.ground-control/gc-doctor"
+  fi
+fi
+
+echo ""
+echo "  Checking that sessions actually start…"
+SELFTEST_DIR="$INSTALL_DIR/.selftest"; mkdir -p "$SELFTEST_DIR"
+ST_JSON="$(curl -s -m 60 -X POST "http://127.0.0.1:8130/api/new-session" \
+  -H 'Content-Type: application/json' \
+  -d "{\"cwd\":\"$SELFTEST_DIR\",\"name\":\"setup-check\"}" 2>/dev/null)"
+if echo "$ST_JSON" | grep -q '"ok":true'; then
+  echo -e "  ${GREEN}✓${NC} a real session started and is running"
+  ST_ID="$(echo "$ST_JSON" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')"
+  curl -s -m 15 -X POST "http://127.0.0.1:8130/api/session/$ST_ID/archive" >/dev/null 2>&1
+  "$INSTALL_DIR/venv/bin/python3" - <<'PYCLEAN' >/dev/null 2>&1 || true
+import sys, os
+sys.path.insert(0, os.path.expanduser("~/.ground-control"))
+import gc_ez
+gc_ez.kill("setup-check")
+PYCLEAN
+else
+  echo ""
+  echo -e "  ${RED}✗ Sessions cannot start on this Mac.${NC}"
+  echo "  The server installed fine, but creating a session failed. Here is why:"
+  echo ""
+  echo "$ST_JSON" | "$INSTALL_DIR/venv/bin/python3" -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print("   " + (d.get("error") or "unknown error"))
+    for line in (d.get("detail") or "").splitlines():
+        print("   " + line)
+except Exception:
+    print("   (no response from the server)")' 2>/dev/null
+  echo ""
+  echo "  Most common causes:"
+  echo "    • Claude Code is installed but you have never signed in — run: claude"
+  echo "    • Claude Code is not on your PATH — run: claude --version"
+  echo ""
+  echo "  Fix that and re-run this installer."
+  echo "  For a full report to send to whoever is helping you, run:  gc-doctor"
+  echo ""
+  exit 1
+fi
+
 echo ""
 echo "  Next steps:"
 echo "  1. iPhone app  → TestFlight: https://testflight.apple.com/join/AgWRZhPJ"
-echo "  2. The Mac app just opened → paste your server address → done."
+echo "  2. The Mac app just opened → it finds this Mac on its own. Nothing to paste."
+echo "     (The server address above is for your PHONE.)"
 echo ""
 echo "  To update everything later: re-run this same command."
 echo ""

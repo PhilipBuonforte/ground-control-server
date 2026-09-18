@@ -3484,6 +3484,15 @@ def _add_owned(sid: str) -> None:
         json.dump(sorted(d), open(_OWNED_PATH, "w"), indent=2)
 
 
+def _forget_owned(sid: str) -> None:
+    """Drop a session we claimed but failed to start. Without this a session that
+    dies at birth stays 'owned' forever — a ghost the app keeps trying to show."""
+    with _owned_lock:
+        d = _load_owned()
+        d.discard(sid)
+        json.dump(sorted(d), open(_OWNED_PATH, "w"), indent=2)
+
+
 _claude_json_lock = threading.Lock()
 
 
@@ -5573,8 +5582,30 @@ def new_session(body: NewSessionBody):
     # --name gives Claude its OWN display name too, so `claude --resume`'s picker and
     # the terminal title show the SAME name as `ez ls` / the app — one name everywhere,
     # not a UUID auto-title on the Claude side.
-    gc_ez.start(ez, cwd, [CLAUDE_BIN, "--session-id", sid, "--name", name,
-                          "--permission-mode", "bypassPermissions"])
+    # VERIFY the session actually came up. This used to fire and forget, so a Claude
+    # that exited instantly (not installed, not signed in, wrong macOS, anything) was
+    # reported to the app as success and the user got a blank screen with no error
+    # anywhere — the 2026-09-17 four-hour debug. Now the failure reaches the person.
+    started = gc_ez.start(ez, cwd, [CLAUDE_BIN, "--session-id", sid, "--name", name,
+                                    "--permission-mode", "bypassPermissions"])
+    if started:
+        # The socket appearing only proves the TERMINAL came up. Claude can still die
+        # inside it a moment later (not signed in, wrong version, folder it refuses),
+        # and the daemon then tears the socket down. Give it a beat and re-check, or
+        # we report success for a session that is already gone — which is precisely
+        # what the user experiences as "it created nothing".
+        time.sleep(2.5)
+        started = gc_ez.is_alive(ez)
+    if not started:
+        why = gc_ez.last_error(ez) or (
+            f"The terminal for this session exited immediately and left no error.\n"
+            f"Claude binary: {CLAUDE_BIN}\n"
+            f"Folder: {cwd}\n"
+            f"Check that Claude Code runs on its own: {CLAUDE_BIN} --version")
+        _forget_owned(sid)
+        print(f"[new-session] FAILED to start {ez!r}: {why}", flush=True)
+        return JSONResponse({"error": "The session could not start.", "detail": why[:1500]},
+                            status_code=500)
 
     def _first_msg():
         # Claude's boot repaints the screen and can pause on gates a fresh session

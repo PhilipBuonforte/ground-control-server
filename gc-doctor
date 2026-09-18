@@ -1,0 +1,103 @@
+#!/bin/bash
+# gc-doctor — everything someone helping you needs, in one paste.
+#
+# Written after a four-hour debugging session over text message (2026-09-17) that
+# cost a new user his evening. The problem was never hard; the problem was that
+# every question took a round trip, and half the answers were ambiguous because the
+# commands couldn't tell the user's action apart from the helper's test.
+#
+# Run it, paste the whole output. No round trips.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+GC="$HOME/.ground-control"
+line() { printf '%s\n' "------------------------------------------------------------"; }
+
+echo "===================== GROUND CONTROL DOCTOR ====================="
+date "+run at %Y-%m-%d %H:%M:%S"
+
+line; echo "MACHINE"
+echo "  computer : $(scutil --get ComputerName 2>/dev/null || hostname)"
+echo "  macOS    : $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+echo "  chip     : $(uname -m)"
+
+line; echo "CLAUDE CODE"
+C=""
+for p in "$(command -v claude 2>/dev/null)" "$HOME/.local/bin/claude" \
+         /opt/homebrew/bin/claude /usr/local/bin/claude "$HOME/.claude/local/claude"; do
+  [ -n "$p" ] && [ -x "$p" ] && { C="$p"; break; }
+done
+if [ -n "$C" ]; then
+  echo "  found    : $C"
+  echo "  version  : $("$C" --version 2>&1 | head -1)"
+  # Signed in? A fresh install is not, and an unauthenticated Claude exits the
+  # instant Ground Control starts it — the single most common cause of "my
+  # sessions don't start".
+  if [ -s "$HOME/.claude/.credentials.json" ] || \
+     security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
+    echo "  signed in: yes"
+  else
+    echo "  signed in: NO  <-- run 'claude' once and log in"
+  fi
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) : ;;
+    *) [ "$C" = "$HOME/.local/bin/claude" ] && \
+         echo "  PATH     : ~/.local/bin is NOT on your PATH (the app still works; your terminal won't find 'claude')" ;;
+  esac
+else
+  echo "  found    : NO  <-- install from https://claude.ai/install.sh"
+fi
+
+line; echo "SERVER"
+if [ -d "$GC" ]; then echo "  installed: $GC"; else echo "  installed: NO ($GC missing)"; fi
+H="$(curl -s -m 5 http://127.0.0.1:8130/api/health 2>/dev/null)"
+if [ -n "$H" ]; then echo "  health   : $H"; else echo "  health   : NOT RESPONDING on port 8130"; fi
+OWNER="$(lsof -nP -iTCP:8130 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (pid "$2")"}')"
+echo "  port 8130: ${OWNER:-nobody is listening}"
+LD="$(launchctl list 2>/dev/null | grep -E 'groundcontrol\.server|pocketclaude\.server' | awk '{print $3" (pid "$1", last exit "$2")"}')"
+echo "  launchd  : ${LD:-not loaded}"
+
+line; echo "SESSIONS"
+echo "  live terminals : $(curl -s -m 5 http://127.0.0.1:8130/api/ez/list 2>/dev/null)"
+echo "  app sees       : $(curl -s -m 8 http://127.0.0.1:8130/api/sessions 2>/dev/null | grep -o '"id"' | wc -l | tr -d ' ') session(s)"
+NSOCK=$(ls "$HOME"/.eztmux/*.sock 2>/dev/null | wc -l | tr -d ' ')
+NPID=$(ls "$HOME"/.eztmux/*.pid 2>/dev/null | wc -l | tr -d ' ')
+echo "  socket dir     : $NSOCK socket(s), $NPID pid file(s)"
+# A pid file with no matching socket is the fingerprint of a session that died at
+# birth — the daemon writes its pid first and binds second.
+for pf in "$HOME"/.eztmux/*.pid; do
+  [ -e "$pf" ] || continue
+  [ -e "${pf%.pid}.sock" ] || echo "    DIED AT STARTUP: $(basename "${pf%.pid}")"
+done
+
+line; echo "MAC APP"
+B="$(defaults read com.philipbuonforte.groundcontrolai.mac serverBase 2>/dev/null)"
+if [ -z "$B" ]; then
+  echo "  points at: this Mac (correct for the Mac running the server)"
+else
+  echo "  points at: $B"
+  case "$B" in
+    *127.0.0.1*|*localhost*) echo "             (local — correct)" ;;
+    *) echo "             NOTE: a non-local address makes the Mac app act as a COMPANION." ;;
+  esac
+fi
+
+line; echo "TAILSCALE"
+TS=""; for t in tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+  command -v "$t" >/dev/null 2>&1 && { TS="$t"; break; }; [ -x "$t" ] && { TS="$t"; break; }
+done
+if [ -n "$TS" ]; then "$TS" status 2>/dev/null | head -4 | sed 's/^/  /'; else echo "  not installed"; fi
+
+line; echo "RECENT SESSION FAILURES (why a session died)"
+found=0
+for f in "$HOME"/.eztmux/*.err; do
+  [ -e "$f" ] || continue
+  found=1
+  echo "  --- $(basename "$f") ---"
+  tail -12 "$f" | sed 's/^/    /'
+done
+[ "$found" = 0 ] && echo "  (none — nothing has failed to start)"
+
+line; echo "SERVER LOG (last errors)"
+grep -iE "FAILED|Traceback|Error" "$GC/server.log" "$GC/server.err" 2>/dev/null | tail -8 | sed 's/^/  /' || echo "  (none)"
+
+line
+echo "=================== END — paste all of the above =================="
