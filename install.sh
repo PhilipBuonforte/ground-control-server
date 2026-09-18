@@ -211,6 +211,9 @@ ST_JSON="$(curl -s -m 60 -X POST "http://127.0.0.1:8130/api/new-session" \
   -d "{\"cwd\":\"$SELFTEST_DIR\",\"name\":\"setup-check\"}" 2>/dev/null)"
 if echo "$ST_JSON" | grep -q '"ok":true'; then
   echo -e "  ${GREEN}✓${NC} a real session started and is running"
+  echo "     (it is named 'setup-check' and is removed automatically — if you see it"
+  echo "      appear in the app and vanish a moment later, that is this test cleaning"
+  echo "      up after itself, not a problem)"
   ST_ID="$(echo "$ST_JSON" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')"
   curl -s -m 15 -X POST "http://127.0.0.1:8130/api/session/$ST_ID/archive" >/dev/null 2>&1
   "$INSTALL_DIR/venv/bin/python3" - <<'PYCLEAN' >/dev/null 2>&1 || true
