@@ -225,6 +225,61 @@ PYFDA
   fi
 fi
 
+# Text Assistant WORKER. The server and the app only configure and display; this
+# agent is the thing that actually watches for incoming texts and decides what to do.
+# It was missing from earlier installs entirely, so the feature looked present and did
+# nothing. Installed under a generic launchd label so it works for any user.
+if [ -f "$DIR/messaging/agent.py" ]; then
+  mkdir -p "$HOME/.imessage-agent"
+  cp "$DIR/messaging/agent.py" "$HOME/.imessage-agent/agent.py"
+  # Record whose assistant this is, so the prompts address the right person.
+  OWNER_FULL="$(id -F 2>/dev/null || echo "")"
+  OWNER_FIRST="${OWNER_FULL%% *}"
+  "$INSTALL_DIR/venv/bin/python3" - "$OWNER_FIRST" <<'PYCFG'
+import json, os, sys
+p = os.path.expanduser("~/.imessage-agent/config.json")
+try:
+    cfg = json.load(open(p))
+except Exception:
+    cfg = {}
+# Safe defaults, and never clobber settings an existing user already chose.
+cfg.setdefault("enabled", False)
+cfg.setdefault("dry_run", True)
+cfg.setdefault("threads", {})
+if sys.argv[1]:
+    cfg["owner_name"] = sys.argv[1]
+json.dump(cfg, open(p, "w"), indent=2)
+PYCFG
+  AGENT_LABEL="com.groundcontrol.imessage-agent"
+  AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+  cat > "$AGENT_PLIST" <<PLIST_END
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$AGENT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$INSTALL_DIR/venv/bin/python3</string>
+    <string>$HOME/.imessage-agent/agent.py</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/.imessage-agent/agent.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.imessage-agent/agent.err</string>
+</dict>
+</plist>
+PLIST_END
+  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null || true
+  sleep 1
+  if launchctl list 2>/dev/null | grep -q "$AGENT_LABEL"; then
+    ok "Text Assistant: watcher running (starts OFF — turn it on in the app)"
+  else
+    warn "Text Assistant: watcher did not start — check ~/.imessage-agent/agent.err"
+  fi
+fi
+
 # gc-doctor: one command that dumps everything a helper needs. Installed next to the
 # server and symlinked onto PATH when we can, so "run gc-doctor and paste it" replaces
 # an evening of back-and-forth.

@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import sys
 import urllib.parse
 import subprocess
 import threading
@@ -1334,7 +1335,11 @@ _IMSG_LOG = _IMSG_DIR / "actions.jsonl"
 def _imsg_running() -> bool:
     try:
         out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5).stdout
-        return "com.philipbuonforte.imessage-agent" in out
+        # Accept BOTH labels: the original private one and the generic label the
+        # installer now uses. Checking only the private one meant every other user's
+        # watcher was invisible to the app, which reported "not running" forever.
+        return ("com.groundcontrol.imessage-agent" in out
+                or "com.philipbuonforte.imessage-agent" in out)
     except Exception:
         return False
 
@@ -1650,6 +1655,48 @@ class IMsgConfig(BaseModel):
     # Installed copies run on whatever python3 the user's Mac has.
     enabled: Optional[bool] = None
     dry_run: Optional[bool] = None
+
+
+@app.get("/api/imessage/setup")
+def imessage_setup():
+    """Is the Text Assistant ACTUALLY ready? One call, three independent facts.
+
+    The app shows this the first time someone opens Messages. Each half fails in a
+    different way and none of them announce themselves: reading needs a macOS
+    permission (symptom: an empty inbox), sending needs a script the installer
+    places (symptom: replies silently never arrive), and the watcher is a separate
+    background job (symptom: nothing ever happens at all). Reporting them
+    separately is what turns "it doesn't work" into one obvious next step."""
+    # 1. Can we read Messages? (Full Disk Access for THIS python binary.)
+    can_read, read_hint = False, ""
+    try:
+        con = sqlite3.connect(f"file:{_CHATDB}?mode=ro", uri=True)
+        con.execute("SELECT 1 FROM message LIMIT 1").fetchone()
+        con.close()
+        can_read = True
+    except Exception as e:                                        # noqa: BLE001
+        read_hint = (f"Grant Full Disk Access to this exact program, then reopen "
+                     f"Ground Control:\n{sys.executable}\n\n"
+                     f"System Settings → Privacy & Security → Full Disk Access → + → "
+                     f"press Cmd+Shift+G and paste that path.  ({type(e).__name__})")
+    # 2. Can we send? (the script the installer places)
+    can_send = _IMSG_SEND.exists() and os.access(_IMSG_SEND, os.X_OK)
+    # 3. Is the watcher running? (the thing that actually decides)
+    running = _imsg_running()
+    cfg = _imsg_config()
+    return {
+        "ready": bool(can_read and can_send and running),
+        "can_read": can_read, "read_hint": read_hint,
+        "can_send": can_send,
+        "send_hint": "" if can_send else
+                     "Re-run the Ground Control installer to install the send script.",
+        "watcher_running": running,
+        "watcher_hint": "" if running else
+                        "Re-run the Ground Control installer to install the watcher.",
+        "enabled": cfg["enabled"], "dry_run": cfg["dry_run"],
+        "threads_on": len([v for v in cfg["threads"].values() if v in ("draft", "send")]),
+        "python": sys.executable,
+    }
 
 
 @app.post("/api/imessage/config")
@@ -3771,9 +3818,26 @@ def self_update():
             tar.extractall(tmp)   # noqa: S202 — our own repo tarball
             src = next(tmp.glob("ground-control-server-*"))
             for f in ["server.py", "gc_ez.py", "gc_ez_engine.py", "gc_sessions.py",
-                      "run_server.sh", "requirements.txt"]:
+                      "run_server.sh", "requirements.txt", "gc-doctor"]:
                 if (src / f).exists():
                     shutil.copy(src / f, install_dir / f)
+                    if f == "gc-doctor":
+                        os.chmod(install_dir / f, 0o755)
+            # Text Assistant pieces. These live OUTSIDE the install dir (the server
+            # and the agent both look for fixed paths in ~), so an update that only
+            # refreshed install_dir left older installs permanently without them.
+            msg = src / "messaging"
+            if msg.exists():
+                skills = Path.home() / ".claude" / "skills" / "send-text"
+                skills.mkdir(parents=True, exist_ok=True)
+                for f in ["send_imessage.sh", "_verify_send.py"]:
+                    if (msg / f).exists():
+                        shutil.copy(msg / f, skills / f)
+                        os.chmod(skills / f, 0o755)
+                if (msg / "agent.py").exists():
+                    agent_dir = Path.home() / ".imessage-agent"
+                    agent_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(msg / "agent.py", agent_dir / "agent.py")
             for d in ["static", "ezterminfo"]:
                 if (src / d).exists():
                     shutil.rmtree(install_dir / d, ignore_errors=True)
