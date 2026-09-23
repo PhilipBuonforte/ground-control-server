@@ -80,6 +80,28 @@ else
   esac
 fi
 
+line; echo "TEXT ASSISTANT"
+# Two independent halves, and they fail in opposite ways: reading needs a macOS
+# permission, sending needs a file the installer places. Either can be broken while
+# the screen still says "Watching your messages".
+SEND="$HOME/.claude/skills/send-text/send_imessage.sh"
+if [ -x "$SEND" ]; then echo "  can send  : yes ($SEND)"
+else echo "  can send  : NO  <-- send script missing; re-run the installer"; fi
+PYBIN="$GC/venv/bin/python3"; [ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
+if "$PYBIN" - <<'PYFDA' 2>/dev/null
+import sqlite3, os, sys
+db = os.path.expanduser("~/Library/Messages/chat.db")
+try:
+    sqlite3.connect("file:%s?mode=ro" % db, uri=True).execute("select 1 from message limit 1")
+except Exception:
+    sys.exit(1)
+PYFDA
+then echo "  can read  : yes"
+else
+  echo "  can read  : NO  <-- needs Full Disk Access for:"
+  echo "              $PYBIN"
+fi
+
 line; echo "TAILSCALE"
 TS=""; for t in tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
   command -v "$t" >/dev/null 2>&1 && { TS="$t"; break; }; [ -x "$t" ] && { TS="$t"; break; }

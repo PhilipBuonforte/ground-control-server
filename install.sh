@@ -189,6 +189,42 @@ fi
 # installer printed "Setup complete!" on a machine where sessions could never start,
 # and the user found out hours later staring at an empty app with no error anywhere
 # (2026-09-17). An installer that cannot prove it works has not finished.
+# Text Assistant send scripts. The server shells out to
+# ~/.claude/skills/send-text/send_imessage.sh to reply to a message; without it the
+# Text Assistant can READ threads but every send silently fails (it returns false and
+# says nothing). That path is not optional — it is what server.py looks for.
+if [ -d "$DIR/messaging" ]; then
+  mkdir -p "$HOME/.claude/skills/send-text"
+  cp "$DIR/messaging/send_imessage.sh" "$HOME/.claude/skills/send-text/send_imessage.sh"
+  cp "$DIR/messaging/_verify_send.py"  "$HOME/.claude/skills/send-text/_verify_send.py"
+  chmod +x "$HOME/.claude/skills/send-text/send_imessage.sh" \
+           "$HOME/.claude/skills/send-text/_verify_send.py"
+  ok "Text Assistant: send scripts installed"
+fi
+
+# Reading the Messages database needs Full Disk Access for the PYTHON BINARY that
+# runs the server — a manual step no installer can perform. Tell the user plainly,
+# because the failure mode is an inbox that looks empty rather than an error.
+if [ -x "$INSTALL_DIR/venv/bin/python3" ]; then
+  if "$INSTALL_DIR/venv/bin/python3" - <<'PYFDA' 2>/dev/null
+import sqlite3, os, sys
+db = os.path.expanduser("~/Library/Messages/chat.db")
+try:
+    sqlite3.connect("file:%s?mode=ro" % db, uri=True).execute("select 1 from message limit 1")
+except Exception:
+    sys.exit(1)
+PYFDA
+  then
+    ok "Text Assistant: can read your Messages"
+  else
+    warn "Text Assistant: CANNOT read your Messages yet (inbox will look empty)"
+    echo "     Grant Full Disk Access to this exact binary, then re-run:"
+    echo "       $(readlink -f "$INSTALL_DIR/venv/bin/python3" 2>/dev/null || echo "$INSTALL_DIR/venv/bin/python3")"
+    echo "     System Settings → Privacy & Security → Full Disk Access → + → press"
+    echo "     Cmd+Shift+G and paste that path."
+  fi
+fi
+
 # gc-doctor: one command that dumps everything a helper needs. Installed next to the
 # server and symlinked onto PATH when we can, so "run gc-doctor and paste it" replaces
 # an evening of back-and-forth.
