@@ -283,6 +283,10 @@ fi
 # gc-doctor: one command that dumps everything a helper needs. Installed next to the
 # server and symlinked onto PATH when we can, so "run gc-doctor and paste it" replaces
 # an evening of back-and-forth.
+if [ -f "$DIR/gc-backup" ]; then
+  cp "$DIR/gc-backup" "$INSTALL_DIR/gc-backup" && chmod +x "$INSTALL_DIR/gc-backup"
+  ln -sf "$INSTALL_DIR/gc-backup" /usr/local/bin/gc-backup 2>/dev/null || true
+fi
 if [ -f "$DIR/gc-doctor" ]; then
   cp "$DIR/gc-doctor" "$INSTALL_DIR/gc-doctor" && chmod +x "$INSTALL_DIR/gc-doctor"
   if [ -w /usr/local/bin ] || mkdir -p /usr/local/bin 2>/dev/null; then

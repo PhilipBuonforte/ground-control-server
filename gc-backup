@@ -1,0 +1,130 @@
+#!/bin/bash
+# gc-backup — save or restore everything that makes Ground Control *yours*.
+#
+#   gc-backup                  → write a snapshot to ~/Desktop
+#   gc-backup restore <file>   → put it all back
+#
+# What this covers: which sessions the app owns, their friendly names, your groups
+# and their order, dividers, pinned folders, session/group artwork, alert settings,
+# Text Assistant configuration, and the app's own preferences (theme, server).
+#
+# What it does NOT cover, because it does not need to: your conversations. Those are
+# Claude Code's transcripts in ~/.claude/projects and are untouched by removing or
+# reinstalling Ground Control. Restoring this snapshot re-attaches the app to
+# conversations that were never lost.
+#
+# The one thing a snapshot cannot save is a RUNNING terminal. Reinstalling stops
+# every live session; they can be resumed afterwards, but anything mid-task is
+# interrupted. That is the real cost of a clean-slate test — not your data.
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Find the server that is ACTUALLY RUNNING and back up ITS state. Guessing
+# ~/.ground-control silently backed up an empty installed copy while the live state
+# sat in a dev checkout — a backup that looks like it worked and restores nothing is
+# worse than no backup at all.
+# Ask the OS for the listening process's working directory. `ps` reports the command
+# as it was typed, which is often a bare "server.py" and resolves to "." — a backup
+# of nothing.
+GC=""
+SRV_PID="$(lsof -nP -iTCP:8130 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $2}')"
+if [ -n "${SRV_PID:-}" ]; then
+  GC="$(lsof -a -d cwd -p "$SRV_PID" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+fi
+if [ -z "${GC:-}" ] || [ ! -f "$GC/gc_owned.json" ]; then
+  for cand in "$HOME/.ground-control" "$(cd "$(dirname "$0")" && pwd)"; do
+    [ -f "$cand/gc_owned.json" ] && GC="$cand" && break
+  done
+fi
+: "${GC:=$HOME/.ground-control}"
+echo "   using server state in: $GC"
+DESKTOP_DIR="$HOME/Library/Application Support/Claude"
+AGENT_DIR="$HOME/.imessage-agent"
+APP_ID="com.philipbuonforte.groundcontrolai.mac"
+
+STATE_FILES=(gc_owned.json ez_names.json cg_names.json groups.json dividers.json
+             folder_pins.json unreads.json settings.json seen.json)
+
+if [ "${1:-}" = "restore" ]; then
+  SRC="${2:?usage: gc-backup restore <snapshot.tgz>}"
+  [ -f "$SRC" ] || { echo "✗ no such file: $SRC"; exit 1; }
+  TMP="$(mktemp -d)"
+  tar -xzf "$SRC" -C "$TMP"
+  SNAP="$TMP/gc-snapshot"
+  [ -d "$SNAP" ] || { echo "✗ that file is not a Ground Control snapshot"; exit 1; }
+
+  mkdir -p "$GC"
+  for f in "${STATE_FILES[@]}"; do
+    [ -f "$SNAP/state/$f" ] && cp "$SNAP/state/$f" "$GC/$f"
+  done
+  if [ -d "$SNAP/icons" ]; then
+    mkdir -p "$GC/icons" && cp -R "$SNAP/icons/." "$GC/icons/"
+  fi
+  # Group assignments live in the Claude desktop app's config, not ours. Merge the
+  # one key we own rather than overwriting a file another app maintains.
+  if [ -f "$SNAP/desktop-slice.json" ]; then
+    mkdir -p "$DESKTOP_DIR"
+    python3 - "$DESKTOP_DIR/claude_desktop_config.json" "$SNAP/desktop-slice.json" <<'PY'
+import json, sys, os
+dst, src = sys.argv[1], sys.argv[2]
+try:
+    cfg = json.load(open(dst))
+except Exception:
+    cfg = {}
+slice_ = json.load(open(src))
+prefs = cfg.setdefault("preferences", {}).setdefault("epitaxyPrefs", {})
+prefs["dframe-local-slice"] = slice_
+json.dump(cfg, open(dst, "w"), indent=2)
+print("   restored groups + ordering")
+PY
+  fi
+  if [ -f "$SNAP/imessage-config.json" ]; then
+    mkdir -p "$AGENT_DIR" && cp "$SNAP/imessage-config.json" "$AGENT_DIR/config.json"
+  fi
+  if [ -f "$SNAP/app-prefs.plist" ]; then
+    defaults import "$APP_ID" "$SNAP/app-prefs.plist" 2>/dev/null \
+      && echo "   restored app preferences (theme, server address)"
+  fi
+  rm -rf "$TMP"
+  echo "✓ restored. Restart the Ground Control app and the server:"
+  echo "    launchctl kickstart -k gui/\$(id -u)/com.groundcontrol.server"
+  exit 0
+fi
+
+# ---- backup ----------------------------------------------------------------
+STAMP="$(date +%Y%m%d-%H%M)"
+TMP="$(mktemp -d)"; SNAP="$TMP/gc-snapshot"
+mkdir -p "$SNAP/state"
+
+for f in "${STATE_FILES[@]}"; do
+  [ -f "$GC/$f" ] && cp "$GC/$f" "$SNAP/state/$f"
+done
+[ -d "$GC/icons" ] && cp -R "$GC/icons" "$SNAP/icons"
+[ -f "$AGENT_DIR/config.json" ] && cp "$AGENT_DIR/config.json" "$SNAP/imessage-config.json"
+
+# Just our slice of the desktop config — never the whole file.
+if [ -f "$DESKTOP_DIR/claude_desktop_config.json" ]; then
+  python3 - "$DESKTOP_DIR/claude_desktop_config.json" "$SNAP/desktop-slice.json" <<'PY'
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    cfg = {}
+sl = ((cfg.get("preferences") or {}).get("epitaxyPrefs") or {}).get("dframe-local-slice") or {}
+json.dump(sl, open(sys.argv[2], "w"), indent=2)
+PY
+fi
+
+defaults export "$APP_ID" "$SNAP/app-prefs.plist" 2>/dev/null || true
+
+OUT="$HOME/Desktop/ground-control-backup-$STAMP.tgz"
+tar -czf "$OUT" -C "$TMP" gc-snapshot
+rm -rf "$TMP"
+
+echo "✓ Saved: $OUT"
+echo "   sessions owned : $(python3 -c "import json;print(len(json.load(open('$GC/gc_owned.json'))))" 2>/dev/null || echo '?')"
+echo "   named sessions : $(python3 -c "import json;print(len(json.load(open('$GC/ez_names.json'))))" 2>/dev/null || echo '?')"
+echo "   artwork files  : $(ls "$GC/icons" 2>/dev/null | wc -l | tr -d ' ')"
+echo "   size           : $(du -h "$OUT" | cut -f1)"
+echo ""
+echo "   Restore with:  gc-backup restore \"$OUT\""
