@@ -159,11 +159,32 @@ if curl -fsSL -o "$APP_TMP/app.zip" \
   if [ -d "$APP_TMP/Ground Control.app" ]; then
     osascript -e 'tell application "Ground Control" to quit' >/dev/null 2>&1 || true
     sleep 1
-    rm -rf "/Applications/Ground Control.app"
-    cp -R "$APP_TMP/Ground Control.app" "/Applications/Ground Control.app"
-    xattr -dr com.apple.quarantine "/Applications/Ground Control.app" 2>/dev/null || true
-    open "/Applications/Ground Control.app" || true
-    ok "Mac app installed to /Applications (launched)"
+    # /Applications is SHARED between everyone with an account on this Mac. Blindly
+    # deleting what is there means an installer run by one person destroys another
+    # person's copy — on a family or work Mac that is somebody else's app. Only
+    # replace a copy we can actually write; otherwise install into this user's own
+    # ~/Applications, which needs no permission and affects nobody else.
+    # (Caught 2026-09-23: a second account's install tried to rm -rf the first
+    # account's app and was stopped only by the OS.)
+    APP_DEST="/Applications/Ground Control.app"
+    if [ -e "$APP_DEST" ] && [ ! -w "$APP_DEST" ]; then
+      mkdir -p "$HOME/Applications"
+      APP_DEST="$HOME/Applications/Ground Control.app"
+      warn "/Applications copy belongs to another user — installing to ~/Applications instead"
+    fi
+    rm -rf "$APP_DEST"
+    if cp -R "$APP_TMP/Ground Control.app" "$APP_DEST" 2>/dev/null; then
+      xattr -dr com.apple.quarantine "$APP_DEST" 2>/dev/null || true
+      open "$APP_DEST" || true
+      ok "Mac app installed to $(dirname "$APP_DEST") (launched)"
+    else
+      mkdir -p "$HOME/Applications"
+      rm -rf "$HOME/Applications/Ground Control.app"
+      cp -R "$APP_TMP/Ground Control.app" "$HOME/Applications/Ground Control.app"
+      xattr -dr com.apple.quarantine "$HOME/Applications/Ground Control.app" 2>/dev/null || true
+      open "$HOME/Applications/Ground Control.app" || true
+      ok "Mac app installed to ~/Applications (launched)"
+    fi
   else
     warn "Downloaded app looked wrong — grab it manually from the releases page."
   fi
