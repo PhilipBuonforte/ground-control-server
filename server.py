@@ -6315,6 +6315,63 @@ def alert_delay() -> int:
     return int(_settings().get("alert_delay", 60))
 
 
+# ── per-session / per-group notification mute ────────────────────────────────
+# The global mute silences EVERYTHING for a while. This is the other axis: one
+# noisy session (or a whole group of them) you never want pinged about, muted
+# indefinitely, while everything else alerts normally.
+_MUTED_PATH = Path(__file__).parent / "muted.json"
+_muted_lock = threading.Lock()
+
+
+def _load_muted() -> dict:
+    try:
+        d = json.load(open(_MUTED_PATH))
+    except (OSError, json.JSONDecodeError):
+        return {"sessions": [], "groups": []}
+    return {"sessions": list(d.get("sessions") or []),
+            "groups": list(d.get("groups") or [])}
+
+
+def _save_muted(d: dict) -> None:
+    # Atomic: two overlapping toggles must not leave a half-written file behind
+    # (the settings.json corruption lesson).
+    tmp = _MUTED_PATH.with_suffix(".json.tmp")
+    json.dump({"sessions": sorted(set(d.get("sessions") or [])),
+               "groups": sorted(set(d.get("groups") or []))},
+              open(tmp, "w"), indent=2)
+    os.replace(tmp, _MUTED_PATH)
+
+
+def _group_id_of(sid: str) -> str:
+    """The custom group a session belongs to, or "" when ungrouped.
+
+    Group assignments are keyed by the DESKTOP record id ("code:local_…"), while
+    every alert carries the Claude session UUID. Looking up the UUID directly
+    matches nothing — silently — so this resolves UUID → local id first. (Caught by
+    testing group mute against a real grouped session rather than assuming.)"""
+    try:
+        cfg = _desktop_config()
+        sl = ((cfg.get("preferences") or {}).get("epitaxyPrefs") or {}).get("dframe-local-slice") or {}
+        assign = sl.get("customGroupAssignments") or {}
+        local = ""
+        for lid, rec in _desktop_records().items():
+            if rec.get("cliSessionId") == sid:
+                local = lid          # already "code:local_…"
+                break
+        return assign.get(local) or assign.get("code:" + sid) or assign.get(sid) or ""
+    except Exception:                                             # noqa: BLE001
+        return ""
+
+
+def _muted_target(sid: str) -> bool:
+    """Is THIS session silenced — directly, or because its group is?"""
+    m = _load_muted()
+    if sid in m["sessions"]:
+        return True
+    gid = _group_id_of(sid)
+    return bool(gid and gid in m["groups"])
+
+
 def _muted() -> bool:
     return time.time() < float(_settings().get("mute_until", 0))
 
@@ -6362,6 +6419,41 @@ def set_settings(body: SettingsBody):
 
 class MuteBody(BaseModel):
     minutes: int  # 0 = unmute
+
+
+class MuteTargetBody(BaseModel):
+    muted: bool = True
+
+
+@app.post("/api/mute/session/{session_id}")
+def mute_session(session_id: str, body: MuteTargetBody):
+    """Silence (or unsilence) one session's notifications, indefinitely."""
+    with _muted_lock:
+        m = _load_muted()
+        ss = set(m["sessions"])
+        ss.add(session_id) if body.muted else ss.discard(session_id)
+        m["sessions"] = list(ss)
+        _save_muted(m)
+    return {"ok": True, "muted": body.muted, "session": session_id}
+
+
+@app.post("/api/mute/group/{group_id}")
+def mute_group(group_id: str, body: MuteTargetBody):
+    """Silence (or unsilence) every session in a group. Sessions moved into the
+    group later are covered too — the check resolves the group at alert time."""
+    with _muted_lock:
+        m = _load_muted()
+        gs = set(m["groups"])
+        gs.add(group_id) if body.muted else gs.discard(group_id)
+        m["groups"] = list(gs)
+        _save_muted(m)
+    return {"ok": True, "muted": body.muted, "group": group_id}
+
+
+@app.get("/api/mute/targets")
+def mute_targets():
+    """Everything currently silenced, for the app to render bells correctly."""
+    return _load_muted()
 
 
 @app.post("/api/mute")
@@ -6629,7 +6721,7 @@ _last_alerted = {}  # session_id -> epoch of last push we sent for it
 def _repeat_check():
     """Re-buzz for sessions still unread after the configured repeat interval."""
     repeat = int(_settings().get("repeat_alert", 0))
-    if repeat <= 0 or _muted():
+    if repeat <= 0 or _muted() or _muted_target(sid):
         return
     now = time.time()
     unreads = _load_unreads()
@@ -6871,6 +6963,10 @@ def _call_check():
             continue
         if sid in _called:
             continue
+        # A muted session must never ring the phone — that is the loudest channel
+        # there is, and it is the whole reason someone mutes one session.
+        if _muted_target(sid):
+            continue
         # NOTE: no _phil_awaiting gate here. Being UNREAD already means an alert fired,
         # which ALREADY passed the engagement gate. Re-checking _phil_awaiting always
         # failed because the alert itself calls _mark_alerted → _alerted_since >=
@@ -6993,6 +7089,9 @@ def _alert_worker():
             badge = mark_unread(sid)
             if _muted():
                 print(f"[alert] muted {sid[:8]}: {title}", flush=True)
+                continue
+            if _muted_target(sid):
+                print(f"[alert] silenced by session/group mute {sid[:8]}: {title}", flush=True)
                 continue
             n_web = send_push(title, p["body"], p["dir"], sid)
             n_apns = send_apns(title, p["body"], p["dir"], sid, badge=badge)
