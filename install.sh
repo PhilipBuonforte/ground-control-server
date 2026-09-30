@@ -116,11 +116,20 @@ cat > "$PLIST" << PLISTEOF
 PLISTEOF
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
-sleep 4
-if curl -s http://127.0.0.1:8130/api/health | grep -q ok; then
+# A cold first boot imports the whole dependency tree, which on a fresh Mac takes
+# well over the 4s this used to allow. The single short check cried wolf on two
+# perfectly healthy installs in one evening (2026-09-29) and sent both users
+# hunting through server.err for a problem that did not exist. Poll instead, and
+# only warn once the server has genuinely had long enough.
+SERVER_UP=""
+for _ in $(seq 1 30); do            # ~30s
+  if curl -s -m 2 http://127.0.0.1:8130/api/health | grep -q ok; then SERVER_UP=1; break; fi
+  sleep 1
+done
+if [ -n "$SERVER_UP" ]; then
   ok "Server running on port 8130"
 else
-  warn "Server didn't answer yet — check $INSTALL_DIR/server.err"
+  warn "Server didn't answer after 30s — check $INSTALL_DIR/server.err"
 fi
 
 # 7. Tailscale — the secure tunnel between your phone and this Mac.
