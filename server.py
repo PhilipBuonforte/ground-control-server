@@ -3407,6 +3407,33 @@ def _name_flag(name: str) -> list:
     return [] if (not name or _UUIDISH.match(name)) else ["--name", name]
 
 
+def _open_session_argv(sid: str, name: str, has_transcript: bool, resume: str) -> list:
+    """The claude argv that OPENS this session's terminal — resume it, or CREATE it.
+
+    A session id with NO transcript has never held a conversation: its very first
+    launch died before Claude wrote anything (Claude not signed in is the common
+    case — a logged-out Claude sits at a prompt and writes nothing). `--resume` on
+    such an id does not "start it anyway": Claude exits with its own
+    `No conversation found with session ID: <uuid>`, printed into the terminal.
+
+    Every path that opens a session (ensure / refresh / wake) used to resume
+    unconditionally, so that session was BRICKED PERMANENTLY — each open retried
+    the same doomed resume, the terminal showed a red error, chat stayed empty
+    forever because there was no transcript to read, and the row still looked
+    alive. Jason hit exactly this (2026-09-30).
+
+    So: create it under the SAME id instead. That is not a fork (invariant #3) —
+    there is no conversation to fork, and this is precisely what the first launch
+    was supposed to do. The identity is preserved, so nothing downstream moves.
+    """
+    if has_transcript:
+        return [CLAUDE_BIN, "--resume", resume, *_name_flag(name),
+                "--permission-mode", "bypassPermissions"]
+    print(f"[ez] {sid[:8]} has no transcript — creating it instead of resuming", flush=True)
+    return [CLAUDE_BIN, "--session-id", sid, *_name_flag(name),
+            "--permission-mode", "bypassPermissions"]
+
+
 def sid_for_ez(ez: str):
     """Reverse lookup: which Claude session id does this EZ handle drive?"""
     for sid, name in _load_ez_names().items():
@@ -3606,8 +3633,7 @@ def ez_ensure(name: str):
     # Resume the CURRENT conversation — after /clear that's a rotated sid; resuming
     # the original would resurrect the conversation the user just cleared.
     resume = _effective_sid(path.parent.name, sid) if path is not None else sid
-    gc_ez.start(name, cwd, [CLAUDE_BIN, "--resume", resume, *_name_flag(name),
-                            "--permission-mode", "bypassPermissions"])
+    gc_ez.start(name, cwd, _open_session_argv(sid, name, path is not None, resume))
     return {"ok": True, "alive": gc_ez.is_alive(name), "started": True}
 
 
@@ -3638,8 +3664,7 @@ def ez_refresh(name: str):
     # Resume the CURRENT conversation — after /clear that's a rotated sid; resuming
     # the original would undo the user's /clear by resurrecting the old one.
     resume = _effective_sid(path.parent.name, sid) if path is not None else sid
-    gc_ez.start(name, cwd, [CLAUDE_BIN, "--resume", resume, *_name_flag(name),
-                            "--permission-mode", "bypassPermissions"])
+    gc_ez.start(name, cwd, _open_session_argv(sid, name, path is not None, resume))
     return {"ok": True, "alive": gc_ez.is_alive(name)}
 
 
@@ -4599,8 +4624,8 @@ def _wake_ez_and_send(session_id: str, text: str):
             cwd = str(Path.home())
         # Resume the CURRENT conversation (follows /clear rotations).
         resume = _effective_sid(path.parent.name, session_id) if path is not None else session_id
-        gc_ez.start(name, cwd, [CLAUDE_BIN, "--resume", resume, *_name_flag(name),
-                                "--permission-mode", "bypassPermissions"])
+        gc_ez.start(name, cwd,
+                    _open_session_argv(session_id, name, path is not None, resume))
 
     def _norm(b: bytes) -> str:
         # A TUI positions text with cursor moves; strip ANSI + whitespace to match.
