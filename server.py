@@ -5686,6 +5686,7 @@ def new_session(body: NewSessionBody):
             return _re.sub(r"\s+", "", s).lower()
 
         trusted = False
+        accepted = False
         ready = False
         for _ in range(60):  # ~30s ceiling
             time.sleep(0.5)
@@ -5693,6 +5694,24 @@ def new_session(body: NewSessionBody):
             if not trusted and ("trustthisfolder" in snap or "yesitrust" in snap):
                 gc_ez.send_input(ez, "\r")  # belt-and-suspenders if pretrust missed
                 trusted = True
+                continue
+            # A Mac that has NEVER run bypassPermissions shows a consent screen first:
+            # "In Bypass Permissions mode, Claude Code will not ask for your approval…
+            #  ❯1. No, exit   2. Yes, I accept".  Answer it with 2.
+            # This MUST be tested before the readiness check below, because that check
+            # matches the words "bypass permissions" — which this very screen contains.
+            # So on a fresh machine the boot watcher declared the session ready, pasted
+            # the first message into a modal dialog, and the session then exited on the
+            # default "No, exit". The app showed an empty sidebar and no error anywhere.
+            # Every brand-new user hits this exactly once (found on Jason's Mac,
+            # 2026-09-29). Answering it is safe: Ground Control only ever launches
+            # with --permission-mode bypassPermissions, so the consent is implied by
+            # the user creating the session at all.
+            if not accepted and ("yes,iaccept" in snap or "no,exit" in snap):
+                gc_ez.send_input(ez, "2")
+                time.sleep(0.15)
+                gc_ez.send_input(ez, "\r")
+                accepted = True
                 continue
             if "bypasspermissions" in snap or 'try"' in snap or "?forshortcuts" in snap:
                 ready = True
