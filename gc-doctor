@@ -28,15 +28,27 @@ done
 if [ -n "$C" ]; then
   echo "  found    : $C"
   echo "  version  : $("$C" --version 2>&1 | head -1)"
-  # Signed in? A fresh install is not, and an unauthenticated Claude exits the
-  # instant Ground Control starts it — the single most common cause of "my
-  # sessions don't start".
-  if [ -s "$HOME/.claude/.credentials.json" ] || \
-     security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
-    echo "  signed in: yes"
-  else
-    echo "  signed in: NO  <-- run 'claude' once and log in"
-  fi
+  # Signed in? A fresh install is not, and an unauthenticated Claude sits at an
+  # idle prompt forever — the single most common cause of "my sessions don't
+  # start". ASK CLAUDE, don't guess from files: this used to test whether a
+  # credentials file or keychain item merely EXISTED, which reported "signed
+  # in: yes" on a Mac whose Claude was showing "Not logged in · Run /login"
+  # (2026-09-29). A stale leftover credential looks identical to a live one on
+  # disk, and a doctor that confidently reports the wrong thing is worse than
+  # one that says nothing — it sent the search in the wrong direction for half
+  # an hour. `claude auth status` is the only answer that comes from Claude.
+  AUTH="$(timeout 20 "$C" auth status 2>/dev/null)"
+  case "$AUTH" in
+    *'"loggedIn": true'*|*'"loggedIn":true'*)
+      echo "  signed in: yes$(printf '%s' "$AUTH" | sed -n 's/.*"email": *"\([^"]*\)".*/  (\1)/p')" ;;
+    *'"loggedIn"'*)
+      echo "  signed in: NO  <-- run 'claude' in a terminal, then /login" ;;
+    *)
+      # Old CLI without `auth status`, or it could not answer. Say so plainly
+      # rather than inventing a verdict from whatever is lying around on disk.
+      echo "  signed in: UNKNOWN — this Claude can't report it. Open a session and"
+      echo "             look at the bottom right of the terminal for 'Not logged in'." ;;
+  esac
   case ":$PATH:" in
     *":$HOME/.local/bin:"*) : ;;
     *) [ "$C" = "$HOME/.local/bin/claude" ] && \
