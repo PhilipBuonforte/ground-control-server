@@ -6376,6 +6376,7 @@ def test_push():
 
 OPENAI_KEY_PATH = Path(__file__).parent / "openai_key.txt"
 TRANSCRIBE_RELAY_URL = "https://groundcontrolai.app/relay/transcribe"
+TTS_RELAY_URL = "https://groundcontrolai.app/relay/tts"
 # Gemini is the dictation BACKSTOP. Voice-to-text used to have exactly one provider,
 # so when the OpenAI balance hit $0 every dictation 502'd and the phone showed nothing
 # at all (2026-10-12). A spoken message is not a place to discover a billing problem.
@@ -6593,6 +6594,21 @@ async def transcribe(file: UploadFile = File(...)):
     return JSONResponse({"error": f"transcribe failed: {reason}"}, status_code=502)
 
 
+def _relay_tts(text: str, voice: str) -> bytes:
+    """Read-aloud through Phil's relay, for installs with no key of their own."""
+    import httpx
+
+    try:
+        r = httpx.post(TTS_RELAY_URL, json={"text": text, "voice": voice}, timeout=70)
+    except Exception as e:
+        print(f"[tts] relay request failed: {type(e).__name__}: {e}", flush=True)
+        return b""
+    if r.status_code == 200:
+        return r.content
+    print(f"[tts] relay {r.status_code}: {r.text[:200]}", flush=True)
+    return b""
+
+
 @app.post("/api/tts")
 def tts(body: TTSBody):
     """Text → natural speech via OpenAI. Returns MP3 bytes."""
@@ -6636,7 +6652,7 @@ def tts(body: TTSBody):
         reason = "openai in backoff (out of credits)"
 
     if not audio:
-        audio = _gemini_tts(text, body.voice)
+        audio = _gemini_tts(text, body.voice) or _relay_tts(text, body.voice)
     if not audio:
         return JSONResponse({"error": f"TTS failed: {reason}"}, status_code=502)
     if len(_tts_cache) > 40:
@@ -6704,7 +6720,7 @@ def tts_stream(tid: str):
     # unavailable this serves a complete file instead. Read-aloud still works; the only
     # loss is the head start on the first chunk.
     def _fallback():
-        audio = _gemini_tts(text, voice)
+        audio = _gemini_tts(text, voice) or _relay_tts(text, voice)
         if not audio:
             return JSONResponse({"error": "TTS failed"}, status_code=502)
         if len(_tts_cache) > 40:
