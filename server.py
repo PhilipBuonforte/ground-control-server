@@ -152,6 +152,37 @@ def _read_lines(path: Path):
     return lines
 
 
+# A DICTATED OR PASTED MESSAGE ARRIVES WRAPPED, AND MUST BE UNWRAPPED FOR DISPLAY.
+# Ground Control types a long message into the terminal as a BRACKETED PASTE — the
+# only way a long message survives Claude Code's TUI intact (see the bracketed-paste
+# note in CLAUDE.md: without it, 2,421 bytes sent arrived as 377). Claude Code then
+# records that paste in the transcript as a literal wrapper:
+#     <pasted_content id="9849">\n<the text>\n</pasted_content id="9849">
+# Nothing ever removed it, and TWO things broke at once (2026-10-17, "things keep
+# pasting like this when i do voice recording thing"):
+#   1. The chat bubble showed the raw tags around every dictated message.
+#   2. The message appeared TWICE. The app draws an optimistic bubble the instant you
+#      hit send and clears it once a real turn arrives whose text starts with the same
+#      40 characters (`ChatView.turnMatches`). The real turn started with
+#      `<pasted_content id=...`, so it never matched, and the optimistic copy stayed on
+#      screen forever beside the wrapped one — one message, two bubbles.
+# Unwrapping at this single choke point fixes both, server-side, with no app update.
+_PASTED_RE = re.compile(
+    r'<pasted_content id="([^"]*)">\n?(.*?)\n?</pasted_content id="\1">', re.S)
+_PASTED_OPEN_RE = re.compile(r'<pasted_content id="[^"]*">\n?')
+_PASTED_CLOSE_RE = re.compile(r'\n?</pasted_content id="[^"]*">')
+
+
+def _unwrap_pasted(text: str) -> str:
+    """Replace each <pasted_content> block with the text inside it."""
+    if "<pasted_content" not in text:
+        return text
+    out = _PASTED_RE.sub(lambda m: m.group(2), text)
+    # A block whose closing tag fell outside the read window (transcripts are read
+    # from their tail) would otherwise leave a bare tag stranded in the bubble.
+    return _PASTED_CLOSE_RE.sub("", _PASTED_OPEN_RE.sub("", out))
+
+
 def _msg_text(entry):
     """Extract displayable text from a user/assistant transcript entry."""
     if entry.get("isMeta"):
@@ -165,7 +196,9 @@ def _msg_text(entry):
         text = "\n".join(p for p in parts if p)
     else:
         return None
-    text = text.strip()
+    # Unwrap BEFORE the harness-noise check below, so a wrapped system record is
+    # still recognised as noise instead of being hidden behind its own tags.
+    text = _unwrap_pasted(text).strip()
     if not text:
         return None
     low = text[:40].lower()
@@ -271,62 +304,93 @@ def parse_turns(path: Path):
             order[e["uuid"]] = i
             if _is_turn(e):
                 leaf = e
+    dir_name = path.parent.name
+    sid = path.stem
+
+    def _turn_of(e):
+        """Build a renderable turn from one transcript entry, or None."""
+        if not _is_turn(e):
+            return None
+        text = _msg_text(e) or ""
+        # HARNESS PLUMBING IS NOT A MESSAGE FROM PHIL. Background-task
+        # notifications, system reminders and slash-command echoes are written into
+        # the transcript with role=user, so the chat rendered them as HIS bubbles —
+        # "I didn't send that". Drop them; they're machine-to-machine chatter.
+        if e.get("type") == "user" and _is_harness_noise(text):
+            return None
+        clean, images = _extract_images(_strip_system_blocks(text))
+        direct = bool(clean) or bool(images)  # user's own text / inline image
+        tool_img = False
+        content = (e.get("message") or {}).get("content")
+        if isinstance(content, list):
+            for i, b in enumerate(content):
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "image":
+                    images.append(f"/api/msgimg/{dir_name}/{sid}/{e['uuid']}/{i}")
+                    direct = True
+                elif b.get("type") == "tool_result":
+                    # Screenshots the agent takes come back as images nested inside
+                    # a tool_result (e.g. Read of a PNG) — index them as "i-j".
+                    inner = b.get("content")
+                    if isinstance(inner, list):
+                        for j, ib in enumerate(inner):
+                            if isinstance(ib, dict) and ib.get("type") == "image":
+                                images.append(
+                                    f"/api/msgimg/{dir_name}/{sid}/{e['uuid']}/{i}-{j}")
+                                tool_img = True
+        if not (clean or images):
+            return None
+        # Show the FULL message — no truncation. (The old 2500-char cap made the
+        # chat window print "…[truncated]" on any longer message, which Phil
+        # rightly flagged: real messages shouldn't be cut.)
+        return {
+            "id": e["uuid"],
+            "role": e["type"],
+            "text": clean,
+            "images": images,
+            "ts": e.get("timestamp"),
+            # Pure tool-result image (no user text/inline image of its own) —
+            # e.g. the agent Read a file. Used to drop the "you sent an image
+            # → the agent read it right back" echo below.
+            "_tool_echo": bool(tool_img and not direct),
+        }
+
     turns = []
     seen = set()
     cur = leaf
-    dir_name = path.parent.name
-    sid = path.stem
     while cur is not None and cur["uuid"] not in seen:
         seen.add(cur["uuid"])
-        if _is_turn(cur):
-            text = _msg_text(cur) or ""
-            # HARNESS PLUMBING IS NOT A MESSAGE FROM PHIL. Background-task
-            # notifications, system reminders and slash-command echoes are written into
-            # the transcript with role=user, so the chat rendered them as HIS bubbles —
-            # "I didn't send that". Drop them; they're machine-to-machine chatter.
-            if cur.get("type") == "user" and _is_harness_noise(text):
-                cur = nodes.get(cur.get("parentUuid"))
-                continue
-            clean, images = _extract_images(_strip_system_blocks(text))
-            direct = bool(clean) or bool(images)  # user's own text / inline image
-            tool_img = False
-            content = (cur.get("message") or {}).get("content")
-            if isinstance(content, list):
-                for i, b in enumerate(content):
-                    if not isinstance(b, dict):
-                        continue
-                    if b.get("type") == "image":
-                        images.append(f"/api/msgimg/{dir_name}/{sid}/{cur['uuid']}/{i}")
-                        direct = True
-                    elif b.get("type") == "tool_result":
-                        # Screenshots the agent takes come back as images nested inside
-                        # a tool_result (e.g. Read of a PNG) — index them as "i-j".
-                        inner = b.get("content")
-                        if isinstance(inner, list):
-                            for j, ib in enumerate(inner):
-                                if isinstance(ib, dict) and ib.get("type") == "image":
-                                    images.append(
-                                        f"/api/msgimg/{dir_name}/{sid}/{cur['uuid']}/{i}-{j}")
-                                    tool_img = True
-            if clean or images:
-                # Show the FULL message — no truncation. (The old 2500-char cap made the
-                # chat window print "…[truncated]" on any longer message, which Phil
-                # rightly flagged: real messages shouldn't be cut.)
-                turns.append(
-                    {
-                        "id": cur["uuid"],
-                        "role": cur["type"],
-                        "text": clean,
-                        "images": images,
-                        "ts": cur.get("timestamp"),
-                        # Pure tool-result image (no user text/inline image of its own) —
-                        # e.g. the agent Read a file. Used to drop the "you sent an image
-                        # → the agent read it right back" echo below.
-                        "_tool_echo": bool(tool_img and not direct),
-                    }
-                )
+        t = _turn_of(cur)
+        if t is not None:
+            turns.append(t)
         cur = nodes.get(cur.get("parentUuid"))
     turns.reverse()
+
+    # A CLIPPED CHAIN IS A BLANK SCREEN — and the window clips it by design.
+    # `_read_lines` deliberately starts an oversized transcript at `size - _BOOT_TAIL`,
+    # so for a big file `nodes` holds only the tail. The leaf→root walk then dies at the
+    # first parent that fell outside the window. When the newest record is ALSO harness
+    # noise (a background job's own <task-notification> is a user-role record), the walk
+    # visits two nodes, drops the one turn it found, and returns nothing — while real
+    # messages sit right there in the window, unreachable because their chain is cut.
+    # That is the "I click the chat and it shows nothing, then I have to fight it to
+    # refresh" bug: Talkies: 1 at a 555MB transcript, and LX: Blog Creator at 19MB
+    # (2026-10-12). It looked intermittent only because each new message briefly
+    # restored an in-window chain.
+    # So when the chain yields nothing, fall back to the window's own turns in FILE
+    # order. That is exactly what `_read_lines` promises its callers — the RECENT
+    # conversation — and it cannot affect a session whose chain resolves, because this
+    # only runs when the result would otherwise be an empty screen.
+    if not turns:
+        for e in lines:
+            t = _turn_of(e)
+            if t is not None:
+                turns.append(t)
+                seen.add(e["uuid"])
+        if turns:
+            print(f"[chat] {sid[:8]} chain clipped by the read window — "
+                  f"showing {len(turns)} in-window turns", flush=True)
     # Collapse the image double: when you send a photo, the agent often Reads it,
     # and that Read comes back as a second, empty user bubble carrying the SAME
     # image — so one send looks like two. Drop a tool-echo image turn when the
@@ -390,7 +454,11 @@ def parse_turns(path: Path):
                     and (att.get("origin") or {}).get("kind") == "human"):
                 # NOT `(att.get("prompt") or "").strip()` — with attachments this is a
                 # content-block LIST, and .strip() on it blanked the whole chat screen.
-                prompt = _as_text(att.get("prompt")).strip()
+                # Unwrap here TOO, not only in `_msg_text`: a queued mid-turn
+                # message never becomes a user record, so it reaches chat through
+                # this branch alone and would keep its paste wrapper (and its
+                # duplicate bubble) after the other path was fixed.
+                prompt = _unwrap_pasted(_as_text(att.get("prompt"))).strip()
                 if prompt and not _is_harness_noise(prompt):
                     clean, images = _extract_images(prompt)
                     if clean or images:
@@ -549,15 +617,20 @@ def _job_descriptions(sid: str):
     path = next(PROJECTS_DIR.glob(f"*/{sid}.jsonl"), None)
     if not path:
         return []
-    st = _desc_cache.setdefault(sid, {"pos": 0, "rows": []})
+    st = _desc_cache.get(sid)
     try:
         size = path.stat().st_size
-        if size < st["pos"]:                     # truncated/rotated → rescan
-            st["pos"], st["rows"] = 0, []
+        if st is None or size < st["pos"]:       # first sight / truncated → start near the end
+            # Never from byte 0: a 1.5GB transcript read whole here ballooned the
+            # server to 26GB and swapped the Mac until no session would load.
+            st = _desc_cache[sid] = {"pos": max(0, size - _BIG_TRANSCRIPT), "rows": []}
+            st["mid"] = st["pos"] > 0
         if size > st["pos"]:
-            with open(path, "r", errors="replace") as f:
+            with open(path, "rb") as f:
                 f.seek(st["pos"])
-                chunk = f.read()
+                if st.pop("mid", False):
+                    f.readline()                 # partial line at the seek point
+                chunk = f.read().decode("utf-8", "replace")
                 st["pos"] = f.tell()
         else:
             return st["rows"]
@@ -663,6 +736,63 @@ def _descendants(pid: str) -> list:
     return out
 
 
+# One log's recent write history, keyed by path: when it last changed, and when it
+# changed before that. The GAP between those two is what separates a stream from a
+# heartbeat.
+_log_hist = {}
+_HEARTBEAT_GAP = 90.0     # changes further apart than this are heartbeats, not work
+
+
+def _log_streaming(path: str, mtime: float) -> bool:
+    """Is this log being written CONTINUOUSLY, or just ticking?
+
+    A single line is not work. "Retry beta review for build 39 every 10 min, logging
+    each try" slept 600s between tries and printed one line each time — which reset
+    `logAge` to 0 and made the whole session read WORKING for 45 seconds, every ten
+    minutes, for an hour (2026-10-12: "it still says there's some background agent
+    working even though there's not"). A real build or test stream writes again
+    almost immediately; a parked loop's next write is minutes away. So compare the two
+    most recent changes: close together = streaming, far apart = a heartbeat.
+
+    A job whose log has changed only ONCE so far is treated as streaming, so a job
+    that genuinely just started still spins — this narrows "moving", never widens it.
+    """
+    h = _log_hist.get(path)
+    if h is None:
+        _log_hist[path] = {"mtime": mtime, "last": mtime, "prev": None}
+        return True
+    # Only FORWARD movement is a new write. A log that is rewritten or truncated can
+    # report an earlier mtime, and treating that as a fresh write would compute a
+    # negative gap and read as streaming.
+    if mtime > h["mtime"]:
+        h["prev"], h["last"], h["mtime"] = h["last"], mtime, mtime
+    if len(_log_hist) > 500:                  # bound memory — drop the oldest seen
+        for k in list(_log_hist)[:200]:
+            if k != path:
+                _log_hist.pop(k, None)
+    if h["prev"] is None:
+        return True
+    return 0 <= (h["last"] - h["prev"]) <= _HEARTBEAT_GAP
+
+
+def _job_moving(j: dict) -> bool:
+    """THE single definition of "this job is doing something right now".
+
+    Both the spinner (`_jobs_moving`) and the sidebar's `jobsMoving` count read this,
+    so the two can never drift apart — they used to carry copies of the same
+    expression. CPU is the strong signal; a growing log counts only when it is
+    actually streaming (see `_log_streaming`)."""
+    if (j.get("cpu") or 0) > 1.0:
+        return True
+    age = j.get("logAge")
+    if age is None or age >= 45:
+        return False
+    log = j.get("log")
+    if not log:
+        return True
+    return _log_streaming(log, time.time() - age)
+
+
 def _jobs_moving(sid: str) -> bool:
     """Is any background job of this session actually MOVING right now?
 
@@ -673,12 +803,9 @@ def _jobs_moving(sid: str) -> bool:
     the stuck-spinner phantom §1 exists to prevent. Alive-and-doing-something spins;
     alive-and-waiting does not — and either way the ⚙ badge still shows it's there."""
     try:
-        for j in bg_jobs(sid):
-            if (j.get("logAge") is not None and j["logAge"] < 45) or (j.get("cpu") or 0) > 1.0:
-                return True
+        return any(_job_moving(j) for j in bg_jobs(sid))
     except Exception:                                             # noqa: BLE001
-        pass
-    return False
+        return False
 
 
 def _job_pulse(pid: int, cmd: str) -> dict:
@@ -1007,6 +1134,20 @@ def last_message_ts(path, fallback: float) -> float:
             # those are the ones that were moving the clock without anything happening.
             if e.get("type") not in ("assistant", "user") or e.get("isMeta"):
                 continue
+            # HARNESS PLUMBING IS NOT A MESSAGE — the third place this rule was needed.
+            # When a big session auto-compacts, Claude Code writes a user record reading
+            # "This session is being continued from a previous conversation…". Nobody
+            # said anything, but it is type=user and not isMeta, so it moved this clock
+            # and the row announced "waiting on you · replied just now" — which reads as
+            # an agent working (2026-10-12, Talkies: 1 at a 555MB transcript). A
+            # background job's <task-notification> does the same thing every time it
+            # prints. `parse_turns` already drops these; so must the activity clock.
+            # Scoped to USER records: an assistant record is genuine model output, and
+            # requiring text there would make a session mid-tool-run look stale.
+            if e.get("type") == "user":
+                _t = _msg_text(e)
+                if not _t or _is_harness_noise(_t):
+                    continue
             t = e.get("timestamp") or ""
             try:
                 ts = datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
@@ -1553,41 +1694,115 @@ def _group_participants_title(conn, cid: str) -> str:
         return ""
 
 
-_chats_cache = {"ts": 0.0, "data": []}
+_chats_cache = {}        # limit -> {"ts": float, "data": [...]}
+_msgs_cache = {}         # (cid, limit) -> {"ts": float, "data": [...]}
 _CHATS_TTL = 6
+
+# A SLOW chat.db MUST NEVER TAKE THE WHOLE SERVER DOWN.
+# FastAPI runs every `def` endpoint in AnyIO's threadpool, which is capped at 40
+# threads. Phil's chat.db is 1.5GB / 851,786 messages, and the old "last message
+# per chat" query — a full GROUP BY over the entire message table — took OVER TWO
+# MINUTES against this 6-SECOND cache TTL. So every poll missed the cache, started
+# its own two-minute scan, and within a minute all 40 workers sat inside SQLite.
+# The server then answered NOTHING — chat blank, sessions blank, usage blank —
+# because every request queued behind a worker that was never coming back, while
+# the port kept ACCEPTING connections so everything looked alive (2026-10-13,
+# "chat is constantly blank" / "even the button that shows the usage doesn't
+# load"). The pile-up also leaked a connection per call until the process hit
+# `OSError: [Errno 24] Too many open files` and the alert loops died too.
+#
+# Two INDEPENDENT guards, because neither alone is enough:
+#   1. The queries below are index-only and ~1s (details at each call site).
+#      Fast queries alone are not a fix — the next big mailbox makes them slow.
+#   2. This gate hard-caps chat.db at 2 concurrent readers, and a caller that
+#      cannot get in IMMEDIATELY serves stale cache instead of waiting. So no
+#      chat.db work can ever occupy more than 2 of the 40 workers, no matter how
+#      slow the database gets. That is what makes the lockup unreachable.
+#
+# NEVER let a chat.db caller block on this gate, and never raise the cap high
+# enough that Messages can starve the rest of the server again.
+_CHATDB_GATE = threading.BoundedSemaphore(2)
+
+
+def _chatdb_cached(store, key, ttl=_CHATS_TTL):
+    """Fresh cached value for `key`, else None. Separate from the stale read so
+    a caller can tell 'still good' from 'nothing better to serve'."""
+    ent = store.get(key)
+    if ent and time.time() - ent["ts"] < ttl:
+        return ent["data"]
+    return None
+
+
+def _chatdb_store(store, key, data, stale):
+    """Remember `data`, falling back to whatever we last had if this read failed.
+    The clock is stamped EVEN ON FAILURE so an unreadable database is retried on
+    the TTL instead of on every single request — that retry storm is what turned
+    one slow query into a dead server."""
+    if len(store) > 200:
+        store.clear()
+    store[key] = {"ts": time.time(), "data": data if data else stale}
+    return store[key]["data"]
 
 
 def _recent_chats(limit: int = 40):
     """Recent Messages threads (last message per chat), newest first."""
-    if time.time() - _chats_cache["ts"] < _CHATS_TTL and _chats_cache["data"]:
-        return _chats_cache["data"]
+    fresh = _chatdb_cached(_chats_cache, limit)
+    if fresh is not None:
+        return fresh
+    stale = (_chats_cache.get(limit) or {}).get("data") or []
+    # Gate shut → serve what we already have rather than join the pile-up.
+    if not _CHATDB_GATE.acquire(blocking=False):
+        return stale
     out = []
     try:
         c = sqlite3.connect(f"file:{_CHATDB}?mode=ro", uri=True)
-        rows = c.execute(
-            "SELECT c.chat_identifier, c.display_name, c.style, m.text, m.attributedBody, "
-            "       m.is_from_me, m.date "
-            "FROM chat c "
-            "JOIN chat_message_join j ON j.chat_id = c.ROWID "
-            "JOIN message m ON m.ROWID = j.message_id "
-            "JOIN (SELECT j2.chat_id cid, MAX(m2.date) md "
-            "      FROM chat_message_join j2 JOIN message m2 ON m2.ROWID=j2.message_id "
-            "      GROUP BY j2.chat_id) last ON last.cid = c.ROWID AND last.md = m.date "
-            "ORDER BY m.date DESC LIMIT ?", (limit,))
-        for cid, dn, style, text, ab, isme, date in rows:
-            is_group = (style == 43) or (cid or "").startswith("chat")
-            title = (dn or "").strip()
-            if not title:
-                title = (_group_participants_title(c, cid) or "Group chat") if is_group \
-                    else (_contact_name(cid) or _pretty_phone(cid))
-            txt = _msg_decode(text, ab)
-            if not txt:
-                txt = "📷 Attachment"
-            elif isme:
-                txt = "You: " + txt
-            out.append({"cid": cid, "title": title, "is_group": is_group,
-                        "last_text": txt, "ts": _apple_ts(date)})
-        c.close()
+        try:
+            # Newest message per chat, from the newest `window` rows of
+            # chat_message_join. `ORDER BY message_id DESC` walks a COVERING
+            # index backwards, so this reads ~`window` rows instead of
+            # aggregating all 851k: 0.01s vs 25s for a byte-identical top-40
+            # (checked against the authoritative GROUP BY, 2026-10-13).
+            # The window widens only when it did not surface enough threads,
+            # which is what keeps a quiet mailbox correct.
+            best = {}
+            window = max(6000, limit * 100)
+            for _ in range(3):
+                best = {}
+                for ch_id, mid, md in c.execute(
+                        "SELECT j.chat_id, j.message_id, j.message_date "
+                        "FROM chat_message_join j "
+                        "ORDER BY j.message_id DESC LIMIT ?", (window,)):
+                    prev = best.get(ch_id)
+                    if prev is None or (md or 0) > prev[1]:
+                        best[ch_id] = (mid, md or 0)
+                if len(best) >= limit:
+                    break
+                window *= 4
+            for ch_id, (mid, _md) in sorted(best.items(),
+                                            key=lambda kv: -kv[1][1])[:limit]:
+                m = c.execute("SELECT text, attributedBody, is_from_me, date "
+                              "FROM message WHERE ROWID=?", (mid,)).fetchone()
+                ch = c.execute("SELECT chat_identifier, display_name, style "
+                               "FROM chat WHERE ROWID=?", (ch_id,)).fetchone()
+                if not m or not ch:
+                    continue
+                text, ab, isme, date = m
+                cid, dn, style = ch
+                is_group = (style == 43) or (cid or "").startswith("chat")
+                title = (dn or "").strip()
+                if not title:
+                    title = (_group_participants_title(c, cid) or "Group chat") if is_group \
+                        else (_contact_name(cid) or _pretty_phone(cid))
+                txt = _msg_decode(text, ab)
+                if not txt:
+                    txt = "📷 Attachment"
+                elif isme:
+                    txt = "You: " + txt
+                out.append({"cid": cid, "title": title, "is_group": is_group,
+                            "last_text": txt, "ts": _apple_ts(date)})
+        finally:
+            c.close()   # ALWAYS — leaking one connection per call is what
+                        # exhausted the process's file descriptors.
     except Exception as e:                                        # noqa: BLE001
         # NEVER silent. An empty Text Assistant inbox looked like "no messages"
         # when the real cause was the Messages database being unreadable — the
@@ -1595,33 +1810,56 @@ def _recent_chats(limit: int = 40):
         print(f"[imsg] CANNOT READ {_CHATDB}: {type(e).__name__}: {e} — "
               f"the Text Assistant inbox will be EMPTY. Usually Full Disk Access "
               f"for the server process.", flush=True)
-    if out:
-        _chats_cache.update({"ts": time.time(), "data": out})
-    return out
+    finally:
+        _CHATDB_GATE.release()
+    return _chatdb_store(_chats_cache, limit, out, stale)
 
 
 def _chat_messages(cid: str, limit: int = 40):
     """Recent real messages in one thread → bubbles for the thread view."""
+    key = (cid, limit)
+    fresh = _chatdb_cached(_msgs_cache, key)
+    if fresh is not None:
+        return fresh
+    stale = (_msgs_cache.get(key) or {}).get("data") or []
+    if not _CHATDB_GATE.acquire(blocking=False):
+        return stale
     out = []
     try:
         c = sqlite3.connect(f"file:{_CHATDB}?mode=ro", uri=True)
-        rows = c.execute(
-            "SELECT m.text, m.attributedBody, m.is_from_me, m.date, h.id "
-            "FROM chat c "
-            "JOIN chat_message_join j ON j.chat_id = c.ROWID "
-            "JOIN message m ON m.ROWID = j.message_id "
-            "LEFT JOIN handle h ON h.ROWID = m.handle_id "
-            "WHERE c.chat_identifier=? ORDER BY m.date DESC LIMIT ?", (cid, limit)).fetchall()
-        for text, ab, isme, date, hid in reversed(rows):
-            body = _msg_decode(text, ab)
-            if not body:
-                continue
-            out.append({"is_from_me": bool(isme), "text": body,
-                        "ts": _apple_ts(date), "handle": hid})
-        c.close()
+        try:
+            # Newest `limit` ids for this thread straight from the
+            # (chat_id, message_date, message_id) index, then hydrate each by
+            # primary key. The old form joined the whole thread and sorted the
+            # result in a temp b-tree: 27.6s on Phil's busiest chat vs 0.29s
+            # here, for the SAME 40 messages (verified 2026-10-13).
+            # `IN` not `=`: one chat_identifier maps to several chat ROWIDs
+            # (iMessage and SMS are separate rows — that thread had three), and
+            # matching only one silently drops messages.
+            ids = c.execute(
+                "SELECT j.message_id FROM chat_message_join j "
+                "WHERE j.chat_id IN (SELECT ROWID FROM chat WHERE chat_identifier=?) "
+                "ORDER BY j.message_date DESC LIMIT ?", (cid, limit)).fetchall()
+            for (mid,) in reversed(ids):
+                row = c.execute(
+                    "SELECT m.text, m.attributedBody, m.is_from_me, m.date, h.id "
+                    "FROM message m LEFT JOIN handle h ON h.ROWID = m.handle_id "
+                    "WHERE m.ROWID=?", (mid,)).fetchone()
+                if not row:
+                    continue
+                text, ab, isme, date, hid = row
+                body = _msg_decode(text, ab)
+                if not body:
+                    continue
+                out.append({"is_from_me": bool(isme), "text": body,
+                            "ts": _apple_ts(date), "handle": hid})
+        finally:
+            c.close()
     except Exception:
         pass
-    return out
+    finally:
+        _CHATDB_GATE.release()
+    return _chatdb_store(_msgs_cache, key, out, stale)
 
 
 @app.get("/api/imessage/status")
@@ -4149,9 +4387,7 @@ def list_sessions():
             # How many are MOVING. The badge tints accent when real work is in flight
             # and stays gray for parked debris (a 2-hour-old log stream at 0% CPU), so
             # the side menu never implies "still working on your task" when it isn't.
-            "jobsMoving": sum(1 for j in alljobs.get(sid, ())
-                              if (j.get("logAge") is not None and j["logAge"] < 45)
-                              or (j.get("cpu") or 0) > 1.0),
+            "jobsMoving": sum(1 for j in alljobs.get(sid, ()) if _job_moving(j)),
             "unread": sid in unreads,
             # Has this session produced output since it was last OPENED (on ANY device)?
             # This is what earns the row's "waiting on you" — computed here, once, so the
@@ -6139,7 +6375,69 @@ def test_push():
 
 
 OPENAI_KEY_PATH = Path(__file__).parent / "openai_key.txt"
+TRANSCRIBE_RELAY_URL = "https://groundcontrolai.app/relay/transcribe"
+# Gemini is the dictation BACKSTOP. Voice-to-text used to have exactly one provider,
+# so when the OpenAI balance hit $0 every dictation 502'd and the phone showed nothing
+# at all (2026-10-12). A spoken message is not a place to discover a billing problem.
+# Credential lives outside the repo per the workspace rule (claude-workspace
+# auto-pushes to GitHub every 15 minutes).
+GEMINI_KEY_PATH = Path.home() / ".config" / "ground-control" / "gemini_key.txt"
+# Once OpenAI says "out of credits" it will keep saying it. Remember that for a while
+# so a dictation doesn't pay a doomed round trip every single time, and let it expire
+# so adding credits heals it with no deploy.
+_openai_cold_until = 0.0
+_OPENAI_COLD = 1800.0
 _tts_cache = {}
+
+
+def _gemini_key() -> str:
+    try:
+        return GEMINI_KEY_PATH.read_text().strip()
+    except Exception:
+        return ""
+
+
+def _gemini_transcribe(data: bytes, content_type: str) -> str:
+    """Transcribe audio with Gemini. Returns "" if it can't."""
+    import base64
+    import httpx
+
+    key = _gemini_key()
+    if not key:
+        return ""
+    mime = content_type or "audio/mp4"
+    # The app records m4a; Gemini wants the container type, and "audio/m4a" is not one
+    # it accepts.
+    if mime in ("audio/m4a", "audio/x-m4a", "audio/aac"):
+        mime = "audio/mp4"
+    try:
+        r = httpx.post(
+            # 3-flash: the key moved (2026-10-27) to the MPB "Default Gemini Project", where
+            # gemini-2.5-flash is "no longer available to new users" (404).
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-3-flash-preview:generateContent",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={"contents": [{"parts": [
+                {"text": "Transcribe this audio verbatim. Output only the transcript, "
+                         "with no preamble, commentary or quotation marks. If there is "
+                         "no intelligible speech, output nothing."},
+                {"inline_data": {"mime_type": mime,
+                                 "data": base64.b64encode(data).decode()}},
+            ]}]},
+            timeout=180,
+        )
+    except Exception as e:
+        print(f"[transcribe] gemini request failed: {type(e).__name__}: {e}", flush=True)
+        return ""
+    if r.status_code != 200:
+        print(f"[transcribe] gemini {r.status_code}: {r.text[:200]}", flush=True)
+        return ""
+    try:
+        parts = r.json()["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts).strip()
+    except Exception as e:
+        print(f"[transcribe] gemini unparseable: {type(e).__name__}: {e}", flush=True)
+        return ""
 
 
 class TTSBody(BaseModel):
@@ -6147,34 +6445,152 @@ class TTSBody(BaseModel):
     voice: str = "nova"
 
 
+# OpenAI voice name -> nearest Gemini prebuilt voice, so a fallback doesn't change
+# gender/character mid-session.
+_GEMINI_VOICES = {
+    "nova": "Kore", "shimmer": "Aoede", "alloy": "Zephyr",
+    "echo": "Puck", "fable": "Fenrir", "onyx": "Charon",
+}
+
+
+def _ffmpeg() -> str:
+    """ffmpeg's absolute path. launchd gives the server a bare PATH, so never
+    rely on the bare name here."""
+    import shutil
+
+    for c in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if Path(c).exists():
+            return c
+    return shutil.which("ffmpeg") or ""
+
+
+def _gemini_tts(text: str, voice: str) -> bytes:
+    """Text -> MP3 via Gemini. Returns b"" if it can't.
+
+    Gemini hands back raw 24kHz mono PCM, but the apps save the body to a file named
+    `.mp3` and let AVFoundation infer the type from that extension — so this MUST come
+    back as real MP3, not a renamed WAV.
+    """
+    import base64
+    import subprocess
+    import httpx
+
+    key = _gemini_key()
+    ff = _ffmpeg()
+    if not key or not ff:
+        if not ff:
+            print("[tts] no ffmpeg — cannot convert gemini audio to mp3", flush=True)
+        return b""
+    try:
+        r = httpx.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.5-flash-preview-tts:generateContent",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text":
+                    "Read naturally and conversationally, at a comfortable pace: " + text}]}],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {
+                        "voiceName": _GEMINI_VOICES.get(voice, "Kore")}}},
+                },
+            },
+            timeout=120,
+        )
+    except Exception as e:
+        print(f"[tts] gemini request failed: {type(e).__name__}: {e}", flush=True)
+        return b""
+    if r.status_code != 200:
+        print(f"[tts] gemini {r.status_code}: {r.text[:200]}", flush=True)
+        return b""
+    try:
+        pcm = base64.b64decode(
+            r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]["data"])
+    except Exception as e:
+        print(f"[tts] gemini unparseable: {type(e).__name__}: {e}", flush=True)
+        return b""
+    try:
+        out = subprocess.run(
+            [ff, "-loglevel", "error", "-f", "s16le", "-ar", "24000", "-ac", "1",
+             "-i", "pipe:0", "-codec:a", "libmp3lame", "-q:a", "4", "-f", "mp3", "pipe:1"],
+            input=pcm, capture_output=True, timeout=120,
+        )
+    except Exception as e:
+        print(f"[tts] ffmpeg failed: {type(e).__name__}: {e}", flush=True)
+        return b""
+    if out.returncode != 0 or not out.stdout:
+        print(f"[tts] ffmpeg rc={out.returncode}: {out.stderr[:200]!r}", flush=True)
+        return b""
+    return out.stdout
+
+
 @app.post("/api/transcribe")
 async def transcribe(file: UploadFile = File(...)):
-    """Voice memo → text (OpenAI Whisper).
+    """Voice memo → text (OpenAI Whisper, with Gemini as the backstop).
 
     Powers "hold the thought": you start dictating in the app, leave to check a note
     or a site while still talking, come back and send. The recording keeps running in
     the background on the phone; this turns it into text when you stop.
     """
-    if not OPENAI_KEY_PATH.exists():
-        return JSONResponse({"error": "no OpenAI key configured"}, status_code=400)
+    global _openai_cold_until
     data = await file.read()
     if not data:
         return JSONResponse({"error": "empty recording"}, status_code=400)
+
+    # Whisper first, Gemini as the backstop. Two providers because one provider means
+    # a billing problem silently eats a spoken message.
+    reason = "no OpenAI key configured"
+    if OPENAI_KEY_PATH.exists() and time.time() >= _openai_cold_until:
+        import httpx
+
+        key = OPENAI_KEY_PATH.read_text().strip()
+        try:
+            r = httpx.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": (file.filename or "memo.m4a", data,
+                                file.content_type or "audio/m4a")},
+                data={"model": "whisper-1"},
+                timeout=180,   # a long ramble can take a while to upload + transcribe
+            )
+        except Exception as e:
+            reason = f"openai request failed: {type(e).__name__}"
+            print(f"[transcribe] {reason}: {e}", flush=True)
+        else:
+            if r.status_code == 200:
+                return {"text": (r.json().get("text") or "").strip(), "via": "whisper"}
+            reason = f"openai {r.status_code}: {r.text[:200]}"
+            print(f"[transcribe] {reason}", flush=True)
+            # Out of credits / rate limited: it will keep saying so. Stop asking.
+            if r.status_code in (401, 402, 429) or "insufficient_quota" in r.text:
+                _openai_cold_until = time.time() + _OPENAI_COLD
+                print(f"[transcribe] backing off openai for "
+                      f"{int(_OPENAI_COLD / 60)}m — using gemini", flush=True)
+    elif OPENAI_KEY_PATH.exists():
+        reason = "openai in backoff (out of credits)"
+
+    text = _gemini_transcribe(data, file.content_type or "")
+    if text:
+        return {"text": text, "via": "gemini"}
+
+    # No key of their own, which is every normal install: Phil's relay transcribes it,
+    # so dictation works for all users with nothing to set up or pay for.
     import httpx
 
-    key = OPENAI_KEY_PATH.read_text().strip()
-    r = httpx.post(
-        "https://api.openai.com/v1/audio/transcriptions",
-        headers={"Authorization": f"Bearer {key}"},
-        files={"file": (file.filename or "memo.m4a", data,
-                        file.content_type or "audio/m4a")},
-        data={"model": "whisper-1"},
-        timeout=180,   # a long ramble can take a while to upload + transcribe
-    )
-    if r.status_code != 200:
-        return JSONResponse({"error": f"transcribe failed: {r.status_code} {r.text[:200]}"},
-                            status_code=502)
-    return {"text": (r.json().get("text") or "").strip()}
+    try:
+        r = httpx.post(TRANSCRIBE_RELAY_URL,
+                       files={"file": (file.filename or "memo.m4a", data,
+                                       file.content_type or "audio/m4a")},
+                       timeout=190)
+    except Exception as e:
+        reason = f"relay request failed: {type(e).__name__}"
+        print(f"[transcribe] {reason}: {e}", flush=True)
+    else:
+        if r.status_code == 200:
+            return {"text": (r.json().get("text") or "").strip(), "via": "relay"}
+        reason = f"relay {r.status_code}: {r.text[:200]}"
+        print(f"[transcribe] {reason}", flush=True)
+    return JSONResponse({"error": f"transcribe failed: {reason}"}, status_code=502)
 
 
 @app.post("/api/tts")
@@ -6182,30 +6598,51 @@ def tts(body: TTSBody):
     """Text → natural speech via OpenAI. Returns MP3 bytes."""
     from fastapi import Response
 
-    if not OPENAI_KEY_PATH.exists():
-        return JSONResponse({"error": "no OpenAI key configured"}, status_code=400)
+    global _openai_cold_until
     text = body.text.strip()[:4000]
     if not text:
         return JSONResponse({"error": "no text"}, status_code=400)
     cache_key = (hash(text), body.voice)
     if cache_key in _tts_cache:
         return Response(content=_tts_cache[cache_key], media_type="audio/mpeg")
-    import httpx
 
-    key = OPENAI_KEY_PATH.read_text().strip()
-    r = httpx.post(
-        "https://api.openai.com/v1/audio/speech",
-        headers={"Authorization": f"Bearer {key}"},
-        json={"model": "gpt-4o-mini-tts", "voice": body.voice, "input": text,
-              "instructions": "Read naturally and conversationally, at a comfortable pace."},
-        timeout=60,
-    )
-    if r.status_code != 200:
-        return JSONResponse({"error": f"TTS failed: {r.status_code} {r.text[:200]}"}, status_code=502)
+    audio = b""
+    reason = "no OpenAI key configured"
+    if OPENAI_KEY_PATH.exists() and time.time() >= _openai_cold_until:
+        import httpx
+
+        key = OPENAI_KEY_PATH.read_text().strip()
+        try:
+            r = httpx.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers={"Authorization": f"Bearer {key}"},
+                json={"model": "gpt-4o-mini-tts", "voice": body.voice, "input": text,
+                      "instructions": "Read naturally and conversationally, at a comfortable pace."},
+                timeout=60,
+            )
+        except Exception as e:
+            reason = f"openai request failed: {type(e).__name__}"
+            print(f"[tts] {reason}: {e}", flush=True)
+        else:
+            if r.status_code == 200:
+                audio = r.content
+            else:
+                reason = f"openai {r.status_code}: {r.text[:200]}"
+                print(f"[tts] {reason}", flush=True)
+                if r.status_code in (401, 402, 429) or "insufficient_quota" in r.text:
+                    _openai_cold_until = time.time() + _OPENAI_COLD
+                    print("[tts] backing off openai — using gemini", flush=True)
+    elif OPENAI_KEY_PATH.exists():
+        reason = "openai in backoff (out of credits)"
+
+    if not audio:
+        audio = _gemini_tts(text, body.voice)
+    if not audio:
+        return JSONResponse({"error": f"TTS failed: {reason}"}, status_code=502)
     if len(_tts_cache) > 40:
         _tts_cache.clear()
-    _tts_cache[cache_key] = r.content
-    return Response(content=r.content, media_type="audio/mpeg")
+    _tts_cache[cache_key] = audio
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 # --- Streaming TTS: register texts once, then GET-stream each so playback starts as the
@@ -6244,11 +6681,17 @@ def tts_batch(body: TTSBatchBody):
 
 @app.get("/api/tts-stream/{tid}")
 def tts_stream(tid: str):
-    """Stream a registered text's speech. Serves cached bytes instantly on replay; otherwise
-    proxies OpenAI's audio as it generates so the player starts almost immediately."""
-    from fastapi.responses import StreamingResponse, Response
-    if not OPENAI_KEY_PATH.exists():
-        return JSONResponse({"error": "no OpenAI key configured"}, status_code=400)
+    """Serve a registered text's speech as MP3. Cached bytes replay instantly.
+
+    This used to proxy OpenAI's bytes through a StreamingResponse. It no longer does,
+    and nothing was lost: the apps fetch this with `URLSession.data(from:)` and write
+    the whole body to a temp file before playing (macOS AVPlayer silently fails on a
+    chunked response), so they never consumed it incrementally. Sending a complete
+    response instead buys the thing that actually matters — a real status code, so a
+    dead provider falls through to the backstop instead of streaming silence.
+    """
+    global _openai_cold_until
+    from fastapi.responses import Response
     reg = _tts_reg.get(tid)
     if reg is None:
         return JSONResponse({"error": "unknown tts id"}, status_code=404)
@@ -6256,30 +6699,48 @@ def tts_stream(tid: str):
     ck = (hash(text), voice)
     if ck in _tts_cache:                          # replay = instant, range-friendly full file
         return Response(content=_tts_cache[ck], media_type="audio/mpeg")
+
+    # Gemini can't stream MP3 (it returns one PCM blob we transcode), so when OpenAI is
+    # unavailable this serves a complete file instead. Read-aloud still works; the only
+    # loss is the head start on the first chunk.
+    def _fallback():
+        audio = _gemini_tts(text, voice)
+        if not audio:
+            return JSONResponse({"error": "TTS failed"}, status_code=502)
+        if len(_tts_cache) > 40:
+            _tts_cache.clear()
+        _tts_cache[ck] = audio
+        return Response(content=audio, media_type="audio/mpeg")
+
+    if not OPENAI_KEY_PATH.exists() or time.time() < _openai_cold_until:
+        return _fallback()
     key = OPENAI_KEY_PATH.read_text().strip()
 
-    def _gen():
-        import httpx
-        parts = []
-        with httpx.stream(
-            "POST", "https://api.openai.com/v1/audio/speech",
+    # Probe before committing to a stream: inside a StreamingResponse generator the
+    # status code is already sent, so a failure there can only end as silence.
+    import httpx
+    try:
+        probe = httpx.post(
+            "https://api.openai.com/v1/audio/speech",
             headers={"Authorization": f"Bearer {key}"},
             json={"model": "gpt-4o-mini-tts", "voice": voice, "input": text,
                   "response_format": "mp3",
                   "instructions": "Read naturally and conversationally, at a comfortable pace."},
             timeout=60,
-        ) as r:
-            if r.status_code != 200:
-                return
-            for chunk in r.iter_bytes():
-                parts.append(chunk)
-                yield chunk
-        if parts:                                 # cache the full audio for instant replay
-            if len(_tts_cache) > 40:
-                _tts_cache.clear()
-            _tts_cache[ck] = b"".join(parts)
-
-    return StreamingResponse(_gen(), media_type="audio/mpeg")
+        )
+    except Exception as e:
+        print(f"[tts] openai request failed: {type(e).__name__}: {e}", flush=True)
+        return _fallback()
+    if probe.status_code != 200:
+        print(f"[tts] openai {probe.status_code}: {probe.text[:200]}", flush=True)
+        if probe.status_code in (401, 402, 429) or "insufficient_quota" in probe.text:
+            _openai_cold_until = time.time() + _OPENAI_COLD
+            print("[tts] backing off openai — using gemini", flush=True)
+        return _fallback()
+    if len(_tts_cache) > 40:
+        _tts_cache.clear()
+    _tts_cache[ck] = probe.content
+    return Response(content=probe.content, media_type="audio/mpeg")
 
 
 class LogBody(BaseModel):
@@ -6523,21 +6984,43 @@ def _tsig(path):
     transcript a beat later → signature changes → the instant alert is dropped, leaving
     only Claude's ~60s 'waiting for input' notification (the observed 60s delay). Ignores
     tool-result user rows (no real text) and title/metadata writes."""
-    last = None
-    count = 0
+    # Incremental by byte offset, and a big file starts from its tail: re-parsing a
+    # 1.5GB transcript from byte 0 on every Stop held the GIL for minutes and uvicorn
+    # stopped accepting connections. The count is only ever compared against an
+    # earlier sig of the same file, so counting from a fixed boot point is equivalent.
+    key = str(path)
     try:
-        with open(path) as f:
-            for line in f:
+        size = os.path.getsize(path)
+        st = _tsig_cache.get(key)
+        if st is None or size < st["pos"]:
+            st = _tsig_cache[key] = {"pos": max(0, size - _BIG_TRANSCRIPT), "count": 0,
+                                     "last": None, "partial": b""}
+            st["mid"] = st["pos"] > 0
+        if size > st["pos"]:
+            with open(path, "rb") as f:
+                f.seek(st["pos"])
+                if st.pop("mid", False):
+                    f.readline()                 # partial line at the seek point
+                chunk = st["partial"] + f.read()
+                st["pos"] = f.tell()
+            nl = chunk.rfind(b"\n")
+            st["partial"] = chunk[nl + 1:]
+            for line in chunk[: nl + 1].split(b"\n"):
+                if b'"user"' not in line:
+                    continue
                 try:
                     d = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     continue
                 if d.get("type") == "user" and not d.get("isSidechain") and d.get("uuid") and _msg_text(d):
-                    last = d["uuid"]
-                    count += 1
+                    st["last"] = d["uuid"]
+                    st["count"] += 1
     except OSError:
         return None
-    return (count, last)
+    return (st["count"], st["last"])
+
+
+_tsig_cache = {}  # transcript path -> {pos, count, last, partial}
 
 
 class EventBody(BaseModel):
@@ -6765,11 +7248,21 @@ _last_alerted = {}  # session_id -> epoch of last push we sent for it
 def _repeat_check():
     """Re-buzz for sessions still unread after the configured repeat interval."""
     repeat = int(_settings().get("repeat_alert", 0))
-    if repeat <= 0 or _muted() or _muted_target(sid):
+    if repeat <= 0 or _muted():
         return
     now = time.time()
     unreads = _load_unreads()
     for sid, marked_ts in unreads.items():
+        # Per-session/group mute belongs INSIDE the loop: `sid` does not exist
+        # until here. Calling _muted_target(sid) in the guard above raised
+        # UnboundLocalError on every pass where repeat alerts were enabled and
+        # nothing was globally muted — 402,121 times over ~9 days. It escaped
+        # into _alert_worker's single try, so everything after this check was
+        # skipped each cycle too: phone-call escalation (_call_check) and
+        # _groups_guard both silently stopped running. Same mistake was caught
+        # in _call_check during the mute work; this copy was missed.
+        if _muted_target(sid):
+            continue
         last = _last_alerted.get(sid, float(marked_ts))
         if now - last < repeat:
             continue
@@ -7067,18 +7560,28 @@ def _groups_guard():
           f"{len(snap['customGroupAssignments'])} from shadow", flush=True)
 
 
+_check_err_ts = {}   # check name -> last time its failure was logged
+
+
 def _alert_worker():
     while True:
         time.sleep(2)   # 2s (was 5s) so a truly-idle / needs-you alert fires within ~2s
-        try:
-            _reap_owned_twins()
-            _watchdog_check()
-            _waiting_check()
-            _repeat_check()
-            _call_check()
-            _groups_guard()
-        except Exception as e:  # noqa: BLE001
-            print(f"[alert] watchdog error: {e}", flush=True)
+        # Each check runs in its OWN try. These are six INDEPENDENT features, and
+        # one shared try meant a single bug in an early one silently disabled every
+        # later one: an UnboundLocalError in _repeat_check took out phone-call
+        # escalation and _groups_guard for ~9 days while the log said only
+        # "watchdog error" 402,121 times. A failure is also rate-limited per check
+        # so a persistent bug leaves a readable log instead of a 1.3GB one.
+        for _check in (_reap_owned_twins, _watchdog_check, _waiting_check,
+                       _repeat_check, _call_check, _groups_guard):
+            try:
+                _check()
+            except Exception as e:  # noqa: BLE001
+                _nm = _check.__name__
+                _last = _check_err_ts.get(_nm, 0.0)
+                if time.time() - _last > 300:   # at most once per 5 min per check
+                    _check_err_ts[_nm] = time.time()
+                    print(f"[alert] {_nm} FAILED: {type(e).__name__}: {e}", flush=True)
         now = time.time()
         due = []
         with _pending_lock:
