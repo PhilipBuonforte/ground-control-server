@@ -46,10 +46,16 @@ for Linux `sudo`, not your Microsoft account.
 
 ```bash
 git clone https://github.com/PhilipBuonforte/ground-control-server.git ~/gc-src
-bash ~/gc-src/windows/setup-wsl.sh
+bash ~/gc-src/windows/setup-wsl.sh --check   # dry run: inspects, changes nothing
+bash ~/gc-src/windows/setup-wsl.sh           # then install for real
 ```
 
-It is idempotent — safe to re-run after a failure.
+Run `--check` first on a new machine. It reports what is missing and what it would do
+without touching anything, so a bad surprise costs you nothing. The real run is
+idempotent too — safe to re-run after any failure.
+
+It also works on plain Linux, not just WSL; the only WSL-specific parts are the
+systemd-in-`/etc/wsl.conf` advice and the `wsl --shutdown` step.
 
 **3. Two things the script can't do for you:**
 
@@ -88,3 +94,11 @@ printf '[boot]\nsystemd=true\n' | sudo tee /etc/wsl.conf
 - **Run Tailscale inside WSL**, not on the Windows host. WSL2 sits behind a NAT, so
   host-side Tailscale does not expose port 8130 from the distro without extra
   forwarding. Tailscale in the distro just works and appears as its own tailnet node.
+
+## Security note
+
+The server listens on `0.0.0.0:8130` and has **no authentication** — this matches the
+Mac (`server.py`'s `__main__` binds `0.0.0.0`, and `run_server.sh` exposes it with
+`tailscale serve`). Anyone who can reach that port can start sessions and run commands
+on the machine. So reach it over **Tailscale**, and never expose port 8130 to a network
+you do not control — a coffee-shop wifi is exactly the wrong place for it.
