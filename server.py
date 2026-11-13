@@ -2734,7 +2734,10 @@ def usage(days: int = 30):
                 continue
         except OSError:
             continue
-        project = path.parent.name.replace("-Users-philipbuonforte-claude-workspace-", "").strip("-") or "unknown folder"
+        # Derive the prefix from THIS machine's home rather than hard-coding one
+        # person's path — this file ships verbatim to the public installer repo.
+        _pfx = str(Path.home()).replace("/", "-") + "-claude-workspace-"
+        project = path.parent.name.replace(_pfx, "").strip("-") or "unknown folder"
         try:
             for e in _scan_usage_file(path, f"{project} (outside GC)", project):
                 if e["ts"] >= cutoff:
@@ -6163,6 +6166,23 @@ def subscribe(body: SubBody):
     return {"ok": True, "count": len(subs)}
 
 
+def _vapid_sub() -> str:
+    """Contact address for web-push VAPID claims.
+
+    It only has to be a reachable mailto, so it belongs in the PRIVATE vapid.json or
+    settings.json — never hard-coded here. This file is copied verbatim into the
+    PUBLIC installer repo, which shipped the maintainer's personal email address from
+    2026-07 until it was caught on 2026-11-12.
+    """
+    try:
+        sub = (VAPID or {}).get("sub") or _settings().get("vapid_sub")
+        if sub:
+            return sub if str(sub).startswith("mailto:") else f"mailto:{sub}"
+    except Exception:                                         # noqa: BLE001
+        pass
+    return "mailto:admin@localhost"
+
+
 def send_push(title: str, msg: str, dir_: str = "", sid: str = ""):
     """Send a web-push notification to all subscribed devices. No-op when the
     legacy web-push keys aren't configured (fresh installs — native apps use the
@@ -6186,7 +6206,7 @@ def send_push(title: str, msg: str, dir_: str = "", sid: str = ""):
                 subscription_info=s,
                 data=payload,
                 vapid_private_key=priv,
-                vapid_claims={"sub": "mailto:philipbuonforte@gmail.com"},
+                vapid_claims={"sub": _vapid_sub()},
                 ttl=3600,
             )
             ok += 1
@@ -6628,7 +6648,7 @@ def _relay_tts(text: str, voice: str) -> bytes:
 # --- Read-aloud text hygiene -------------------------------------------------
 # Read-aloud used to speak a message VERBATIM, so a normal engineering reply —
 # which is mostly backticked paths, shell commands, URLs and build ids — came out
-# as "see slash Users slash philipbuonforte slash claude dash workspace slash…",
+# as "see slash Users slash <you> slash claude dash workspace slash…",
 # one slash at a time, for minutes (Phil, reading a chat in bed, 2026-11-06).
 # `_speakable` keeps the prose and the FILENAME (hearing "ChatView.swift, line
 # 3497" is useful) and drops the 90 characters of directory leading to it.
@@ -7513,7 +7533,7 @@ _BLAND_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 
 def _e164(num: str) -> str:
     """Normalize a phone number to E.164 (Bland requires it). A US 10-digit number
-    typed without a country code (e.g. '8014738272') becomes '+18014738272'."""
+    typed without a country code (e.g. '5551234567') becomes '+15551234567'."""
     num = (num or "").strip()
     digits = "".join(ch for ch in num if ch.isdigit())
     if num.startswith("+"):
@@ -7539,7 +7559,7 @@ def _bland_conf() -> dict:
 
 def _place_call(number: str, message: str) -> bool:
     """Phone-call Phil and speak `message`, then hang up. Uses the SAME Bland.ai setup as
-    the Link-X Sales Agent (from-number +14158775842). Config from settings.json:
+    the Link-X Sales Agent (its own from-number). Config from settings.json:
       bland_key            — Bland API key (required)
       bland_relay_secret   — if set, route via the Cloudflare relay (needed only from
                              DigitalOcean IPs; from Phil's Mac we can hit Bland directly)
