@@ -47,6 +47,9 @@ body.resizing{cursor:col-resize;user-select:none}
 }
 .card:hover{background:var(--hover)}
 .card .grow{flex:1}
+.card.on{background:var(--accent);color:#fff}
+.card.on .ico{color:#fff}
+.card.on .badge{background:#fff;color:var(--accent)}
 .badge{
   background:var(--blue);color:#fff;border-radius:999px;min-width:22px;height:22px;
   display:grid;place-items:center;font-size:12px;font-weight:700;padding:0 6px;
@@ -378,11 +381,19 @@ function md(t){
 
 function render(){
   if(openGroups===null) openGroups = groups.map(g=>g.name);
+  const att = attentionSessions();
+  $("#needsCount").textContent = att.length;
+  $("#needsBtn").classList.toggle("on", needsMe);
+  if(needsMe){
+    $("#list").innerHTML = att.length
+      ? `<div class="gbox" style="margin-top:8px">${att.map(rowHTML).join("")}</div>`
+      : `<div style="padding:26px 10px;color:var(--muted);font-size:14px">Nothing needs you right now.</div>`;
+    return;
+  }
   let needs = 0;
   const html = groups.map(g => {
     const open = openGroups.includes(g.name);
     const sess = g.sessions||[], divs = g.dividers||[];
-    needs += sess.filter(s=>s.unread).length;
     let inner = "";
     if(open){
       inner = sess.map(rowHTML).join("");
@@ -406,7 +417,6 @@ function render(){
     </div>`;
   }).join("");
   $("#list").innerHTML = html;
-  $("#needsCount").textContent = needs;
 }
 
 async function poll(){
@@ -532,12 +542,39 @@ $("#feed").addEventListener("click", e => {
   if(b.classList.contains("spk")) speak(t.text, b);
   else if(b.classList.contains("spkrest"))
     speak(lastTurns.slice(i).filter(x=>x.text).map(x=>x.text).join("\n\n"), b);
-  else if(b.classList.contains("cp")){
-    navigator.clipboard.writeText(t.text||"").then(()=>{
-      const old = b.innerHTML; b.textContent = "✓"; setTimeout(()=>b.innerHTML = old, 900);
-    });
-  }
+  else if(b.classList.contains("cp")) copyText(t.text || "", b);
 });
+/* navigator.clipboard only exists in a SECURE context. Reaching this app over the
+   tailnet (http://100.x.x.x:8130) is not one, so the promise rejects and the copy
+   silently does nothing — caught by the Playwright run, which reported
+   "Write permission denied". Fall back to execCommand and, failing that, SAY so
+   rather than pretending it worked. */
+function copyText(text, btn){
+  const done = ok => {
+    const old = btn.innerHTML;
+    btn.textContent = ok ? "\u2713" : "\u2717";
+    setTimeout(() => { btn.innerHTML = old; }, 1000);
+    if(!ok) flagErr("copy blocked — open the app over localhost for clipboard access");
+  };
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(text).then(() => done(true), () => done(legacyCopy(text)));
+    return;
+  }
+  done(legacyCopy(text));
+}
+function legacyCopy(text){
+  try{
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;left:-9999px;top:0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }catch(e){ return false; }
+}
+
 $("#send").addEventListener("click", send);
 $("#msg").addEventListener("keydown", e=>{ if(e.key==="Enter") send(); });
 $("#sideToggle").addEventListener("click", ()=> $("#side").classList.toggle("hide"));
@@ -550,17 +587,42 @@ sheet.addEventListener("click", e => { if(e.target === sheet) closeSheet(); });
 document.addEventListener("keydown", e => { if(e.key === "Escape") closeSheet(); });
 
 $("#usageBtn").addEventListener("click", async () => {
-  openSheet("<h3>Usage</h3><div class='kv'>loading…</div>");
+  openSheet("<h3>Usage</h3><div class='kv'>loading...</div>");
   try{
     const u = await j("/api/usage-summary");
-    const rows = [
-      ["This week", (u.week_pct ?? 0) + "%"],
-      ["5-hour window", (u.five_pct ?? 0) + "%"],
-      ["Week resets", (u.week_resets || "").slice(0,16).replace("T"," ")],
-    ].concat((u.scoped||[]).map(x => [x.name, x.pct + "%"]));
-    openSheet("<h3>Usage</h3>" + rows.map(([k,v]) =>
-      `<div class="kv"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("") +
-      `<p style="color:var(--muted);font-size:13px;margin-top:14px">Percent of plan — the meter that matters. Dollars only exist in overage.</p>`);
+    const clock = iso => { try{ return new Date(iso).toLocaleString([], {weekday:"short", hour:"numeric", minute:"2-digit"}); }catch(e){ return ""; } };
+    const meter = (label, pct, sub, crit) => `
+      <div style="margin:13px 0 15px">
+        <div style="display:flex;justify-content:space-between;font-size:13.5px;font-weight:650">
+          <span>${esc(label)}</span><span style="color:${crit?"#D64545":"var(--muted)"}">${esc(sub)}</span></div>
+        <div style="height:8px;background:var(--selection);border-radius:99px;margin-top:5px;overflow:hidden">
+          <div style="height:100%;width:${Math.min(100, pct||0)}%;border-radius:99px;
+            background:${crit?"#D64545":(pct>=70?"#D9954F":"var(--accent)")}"></div></div></div>`;
+    let html = "<h3>Usage</h3>";
+    html += meter("5-hour window", u.five_pct,
+                  `${Math.round(u.five_pct)}%${u.five_resets?" \u00b7 resets "+clock(u.five_resets):""}`,
+                  u.five_pct >= 95);
+    html += meter("Weekly (all)", u.week_pct,
+                  `${Math.round(u.week_pct)}%${u.week_resets?" \u00b7 resets "+clock(u.week_resets):""}`,
+                  u.week_pct >= 95);
+    for(const sc of (u.scoped||[]))
+      html += meter(`Weekly (${sc.name})`, sc.pct, `${Math.round(sc.pct)}%`, sc.critical);
+    if(u.credits_balance || u.credits_used)
+      html += `<div class="kv"><span>Credits used</span><b>$${(u.credits_used||0).toFixed(2)}</b></div>
+               <div class="kv"><span>Balance</span><b>$${(u.credits_balance||0).toFixed(2)}</b></div>`;
+    html += `<div style="margin-top:16px;font-size:13.5px;font-weight:750">By session \u00b7 this week</div>
+             <div id="ubreak" style="color:var(--muted);font-size:13px;padding:8px 0">loading...</div>`;
+    openSheet(html);
+    const b = await j("/api/usage-breakdown?window=week");
+    const rows = (b.sessions||[]).slice(0, 14);
+    const fmt = n => n >= 1e9 ? (n/1e9).toFixed(1)+"B" : n >= 1e6 ? (n/1e6).toFixed(1)+"M"
+               : n >= 1e3 ? (n/1e3).toFixed(1)+"k" : String(n|0);
+    const el = $("#ubreak");
+    if(el) el.innerHTML = rows.length ? rows.map(r => `
+      <div class="kv"><span style="max-width:58%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        ${esc(r.title||r.sid)}<span style="color:var(--muted)"> \u00b7 ${esc(r.project||"")}</span></span>
+        <b>${(r.pct_week ?? 0).toFixed(1)}% \u00b7 ${fmt(r.tokens||0)} tok</b></div>`).join("")
+      : "<div class='kv'>No token usage in this window.</div>";
   }catch(e){ openSheet("<h3>Usage</h3><p>Could not load usage.</p>"); }
 });
 
@@ -610,10 +672,19 @@ $("#newBtn").addEventListener("click", () => {
   });
 });
 
-$("#needsBtn").addEventListener("click", () => {
-  const n = groups.flatMap(g => g.sessions||[]).find(s => s.unread);
-  if(n) openSession(n.id, n.dir);
-});
+/* The lens. One click on, one click off. When ON the list goes FLAT - no headers, no
+   dividers, collapse ignored - because a collapsed group must never hide live work or
+   an unread reply; that is the whole point of the button (MacRootView.runningFilterPill
+   + SessionListView.visibleRows). Contents = attentionSessions(): everything currently
+   working, then everything unseen, deduped, running first. */
+let needsMe = false;
+function attentionSessions(){
+  const all = groups.flatMap(g => g.sessions || []);
+  const running = all.filter(s => (Date.now() - (busySince[s.id] || 0)) < WINDOW);
+  const seen = new Set(running.map(s => s.id));
+  return running.concat(all.filter(s => s.unseen && !seen.has(s.id)));
+}
+$("#needsBtn").addEventListener("click", () => { needsMe = !needsMe; render(); });
 
 /* ---------- dictation ----------
    The same "hold the thought" flow the phone has: start talking, keep talking, stop,
