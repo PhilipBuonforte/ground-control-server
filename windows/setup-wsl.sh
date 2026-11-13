@@ -56,9 +56,14 @@ for p in python3-venv python3-pip; do dpkg -s "$p" >/dev/null 2>&1 || NEED="$NEE
 if [ -n "$NEED" ]; then
   if [ $CHECK = 1 ]; then would "sudo apt-get install -y$NEED"
   else
-    say "installing:$NEED (sudo will ask for your Linux password)"
-    sudo apt-get update -qq || die "apt-get update failed — does WSL have network? try: curl -I https://github.com"
-    sudo apt-get install -y -qq $NEED || die "apt-get install failed:$NEED"
+    if sudo -n true 2>/dev/null; then
+      sudo apt-get update -qq && sudo apt-get install -y -qq $NEED \
+        || warn "apt failed; continuing — the venv fallback below does not need these"
+    else
+      warn "missing:$NEED — and sudo wants a password."
+      warn "Continuing anyway: the venv step bootstraps pip without sudo."
+      warn "If you want them properly: sudo apt-get install -y$NEED"
+    fi
   fi
 else
   ok "python3 / git / curl / venv all present"
@@ -98,7 +103,20 @@ if [ $CHECK = 1 ]; then
   would "python3 -m venv $DIR/venv && pip install -r requirements.txt"
 else
   say "Installing Python dependencies (first run takes a minute)…"
-  [ -d "$DIR/venv" ] || python3 -m venv "$DIR/venv" || die "could not create venv (is python3-venv installed?)"
+  # Stock Ubuntu on WSL ships python3 WITHOUT python3-venv/pip, and `sudo` wants a
+  # password an unattended install cannot supply. So: try the normal venv, and if
+  # ensurepip is missing fall back to --without-pip and bootstrap pip ourselves.
+  # Verified on a clean ThinkPad install 2026-11-12 — no sudo needed at all.
+  if [ ! -d "$DIR/venv" ]; then
+    python3 -m venv "$DIR/venv" 2>/dev/null || {
+      warn "python3-venv missing — building the venv without sudo"
+      python3 -m venv --without-pip "$DIR/venv" || die "could not create venv at all"
+      curl -sS --max-time 120 https://bootstrap.pypa.io/get-pip.py -o /tmp/gc-getpip.py \
+        || die "could not download get-pip.py"
+      "$DIR/venv/bin/python3" /tmp/gc-getpip.py -q || die "could not bootstrap pip"
+      rm -f /tmp/gc-getpip.py
+    }
+  fi
   "$DIR/venv/bin/python3" -m pip install -q --upgrade pip
   "$DIR/venv/bin/python3" -m pip install -q -r "$DIR/requirements.txt" \
     || die "pip install failed. Run it by hand to see why: $DIR/venv/bin/python3 -m pip install -r $DIR/requirements.txt"
@@ -145,6 +163,12 @@ if not any(CMD in json.dumps(x) for x in pre):
 # bricking on "Prompt is too long". Measured 2026-11-12: a session with it off reached
 # 975,000 tokens and had to be cleared by hand.
 cfg.setdefault("autoCompactEnabled", True)
+# CRITICAL on a fresh machine. Ground Control launches sessions with
+# --permission-mode bypassPermissions; Claude Code then shows a one-time
+# "Yes, I accept" confirmation. Nothing answers it, so the PTY exits after ~5s and
+# EVERY session dies at birth. Seen on a clean ThinkPad 2026-11-12: the fingerprint
+# is ~/.eztmux/<name>.err ending in "No, exit / Yes, I accept".
+cfg.setdefault("skipDangerousModePermissionPrompt", True)
 tmp = p + ".tmp"
 json.dump(cfg, open(tmp, "w"), indent=2)
 os.replace(tmp, p)          # atomic: a half-written settings.json silently breaks alerts

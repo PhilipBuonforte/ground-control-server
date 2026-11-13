@@ -102,3 +102,22 @@ Mac (`server.py`'s `__main__` binds `0.0.0.0`, and `run_server.sh` exposes it wi
 `tailscale serve`). Anyone who can reach that port can start sessions and run commands
 on the machine. So reach it over **Tailscale**, and never expose port 8130 to a network
 you do not control — a coffee-shop wifi is exactly the wrong place for it.
+
+## Two first-run walls on a clean machine (both handled, 2026-11-12)
+
+Found while installing on a stock ThinkPad:
+
+1. **Every session dies at birth.** Ground Control launches Claude Code with
+   `--permission-mode bypassPermissions`, which triggers a one-time
+   "Yes, I accept" confirmation. Nothing answers it, so the PTY exits in ~5 seconds.
+   The fingerprint is `~/.eztmux/<name>.err` ending in `No, exit / Yes, I accept`.
+   The installer now sets `skipDangerousModePermissionPrompt: true`.
+
+2. **`python3-venv` is missing and `sudo` wants a password.** Stock Ubuntu on WSL has
+   `python3` but not `venv`/`pip`, and an unattended install cannot type a password.
+   The installer now falls back to `python3 -m venv --without-pip` plus a `get-pip.py`
+   bootstrap — the whole install needs **no sudo at all**.
+
+One prompt is still manual: the first session you open may ask
+"Try the new fullscreen renderer?". Answer **2 (Not now)** — it changes how the PTY
+draws and the terminal view depends on that. It only appears once.
