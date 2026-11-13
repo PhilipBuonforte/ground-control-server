@@ -1,0 +1,600 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Ground Control</title>
+<link rel="manifest" href="/static/app.webmanifest">
+<style>
+/* Palette lifted verbatim from GroundControlMac/Theme.swift so the web app and the
+   native app are the same product, not a lookalike. */
+:root{
+  --paper:#FAF9F5; --sidebar:#F1EEE8; --selection:#EAE6DE; --hover:#F0EDE6;
+  --userBubble:#F0EEE9; --accent:#D97757; --muted:#73706A; --live:#5FA463;
+  --idle:#BFBAB0; --border:#E3DFD6; --ink:#2B2A27; --blue:#4C8DFF; --new:#3F7D58;
+  --banner:#5A6270;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  background:var(--paper); color:var(--ink);
+  font:15px/1.45 ui-rounded,-apple-system,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased; overflow:hidden;
+}
+#app{display:flex;height:100%}
+
+/* ---------- sidebar ---------- */
+#side{
+  width:352px;flex:none;background:var(--sidebar);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow:hidden;
+}
+#sideTop{padding:12px 12px 6px;display:flex;flex-direction:column;gap:8px}
+.card{
+  background:#fff;border:1px solid var(--border);border-radius:14px;
+  padding:12px 14px;display:flex;align-items:center;gap:10px;cursor:pointer;
+  font-weight:650;font-size:16px;
+}
+.card:hover{background:var(--hover)}
+.card .grow{flex:1}
+.badge{
+  background:var(--blue);color:#fff;border-radius:999px;min-width:22px;height:22px;
+  display:grid;place-items:center;font-size:12px;font-weight:700;padding:0 6px;
+}
+#list{flex:1;overflow-y:auto;padding:6px 12px 24px}
+
+.group{margin-top:10px}
+.ghead{
+  display:flex;align-items:center;gap:10px;padding:6px 4px;cursor:pointer;
+  font-weight:750;font-size:17px;user-select:none;
+}
+.ghead .chev{color:var(--muted);font-size:13px;width:12px;transition:transform .15s}
+.ghead.open .chev{transform:rotate(90deg)}
+.gicon{width:30px;height:30px;border-radius:9px;object-fit:cover;flex:none;background:var(--selection)}
+.gbox{background:#fff;border:1px solid var(--border);border-radius:16px;margin-top:6px;overflow:hidden}
+.gbox.empty{display:none}
+
+.row{
+  display:flex;align-items:center;gap:10px;padding:8px 11px;cursor:pointer;
+  border-bottom:1px solid var(--border);
+}
+.row:last-child{border-bottom:none}
+.row:hover{background:var(--hover)}
+.row.sel{background:var(--accent)}
+.row.sel .title,.row.sel .status{color:#fff}
+.row.sel .ring text{fill:#fff}
+.avatar{width:42px;height:42px;border-radius:12px;object-fit:cover;flex:none;background:var(--selection)}
+.ava{width:42px;height:42px;border-radius:12px;flex:none;display:grid;place-items:center;
+  color:#fff;font-weight:800;font-size:17px}
+.dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--idle)}
+.dot.live{background:var(--live)}
+.spin{
+  width:14px;height:14px;flex:none;border-radius:50%;
+  border:2px solid rgba(217,119,87,.25);border-top-color:var(--accent);
+  animation:sp .8s linear infinite;
+}
+.row.sel .spin{border-color:rgba(255,255,255,.35);border-top-color:#fff}
+@keyframes sp{to{transform:rotate(360deg)}}
+.meta{flex:1;min-width:0}
+.title{font-size:15px;font-weight:650;line-height:1.25;letter-spacing:-.1px;overflow:hidden;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.title.unread{font-weight:800}
+.status{font-size:10.5px;font-weight:550;color:var(--muted);margin-top:2px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.status.working{color:var(--accent)}
+.status.new{color:var(--new);font-weight:650}
+.ring{flex:none}
+.jobs{
+  font-size:11px;font-weight:700;color:var(--muted);background:var(--selection);
+  border-radius:999px;padding:2px 7px;flex:none;
+}
+.unread-dot{width:9px;height:9px;border-radius:50%;background:var(--blue);flex:none}
+.divider{
+  display:flex;align-items:center;gap:8px;padding:7px 12px;cursor:pointer;
+  font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--muted);
+  text-transform:uppercase;border-bottom:1px solid var(--border);
+}
+.divider .line{flex:1;height:1px;background:var(--border)}
+
+/* ---------- content ---------- */
+#main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--paper)}
+#head{
+  display:flex;align-items:center;gap:14px;padding:12px 18px;
+  border-bottom:1px solid var(--border);flex:none;
+}
+#headTitle{font-size:19px;font-weight:750;flex:1;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.seg{background:var(--selection);border-radius:11px;padding:3px;display:flex;gap:3px}
+.seg button{
+  border:0;background:transparent;border-radius:9px;padding:6px 20px;cursor:pointer;
+  font:inherit;font-size:15px;font-weight:650;color:var(--muted);
+}
+.seg button.on{background:#fff;color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.09)}
+#banner{
+  background:var(--banner);color:#fff;padding:10px 18px;font-weight:700;font-size:15px;
+  display:flex;align-items:center;gap:10px;flex:none;
+}
+#banner .r{margin-left:auto;font-weight:600;opacity:.9;font-size:13px}
+#headIcons{display:flex;align-items:center;gap:12px;margin-left:14px}
+.hicon{border:0;background:transparent;font-size:16px;cursor:pointer;color:var(--muted);
+  padding:4px 6px;border-radius:8px;line-height:1}
+.hicon:hover{background:var(--selection);color:var(--ink)}
+#statusbar{flex:none;border-top:1px solid var(--border);padding:7px 18px;display:none;
+  align-items:center;gap:12px;font-size:12.5px;color:var(--muted);background:var(--paper)}
+.pill{background:rgba(76,141,255,.12);color:#2F6BD6;border-radius:999px;
+  padding:3px 11px;font-weight:700;font-size:12px}
+#sbRight{margin-left:auto;display:flex;align-items:center;gap:10px;font-weight:650}
+.cicon{border:0;background:transparent;font-size:18px;cursor:pointer;color:var(--muted);
+  padding:6px;border-radius:9px;line-height:1}
+.cicon:hover{background:var(--selection);color:var(--ink)}
+.cicon.rec{color:#D64545}
+#sheet{position:fixed;inset:0;background:rgba(0,0,0,.28);display:none;
+  align-items:center;justify-content:center;z-index:20}
+#sheetBox{background:var(--paper);border-radius:18px;max-width:560px;width:92%;
+  max-height:80%;overflow:auto;padding:22px 24px;box-shadow:0 20px 60px rgba(0,0,0,.25)}
+#sheetBox h3{margin:0 0 14px;font-size:19px}
+#sheetBox .kv{display:flex;justify-content:space-between;padding:7px 0;
+  border-bottom:1px solid var(--border);font-size:14.5px}
+#feed{flex:1;overflow-y:auto;padding:22px 26px 10px}
+.turn{max-width:860px;margin:0 auto 22px;font-size:16.5px;line-height:1.55;white-space:pre-wrap;word-wrap:break-word}
+.turn.user{background:var(--userBubble);border:1px solid var(--border);
+  border-radius:16px;padding:12px 16px;white-space:pre-wrap}
+.turn img{max-width:300px;border-radius:12px;display:block;margin:8px 0}
+.turn b{font-weight:750}
+.turn .h{font-weight:800;font-size:17.5px;margin:14px 0 4px}
+.turn .li{margin:2px 0 2px 2px}
+.turn code{background:var(--selection);border-radius:5px;padding:1px 5px;
+  font:13.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.turn pre.code{background:#2B2A27;color:#F5F3EE;border-radius:12px;padding:12px 14px;
+  overflow-x:auto;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  white-space:pre;margin:10px 0}
+.turn a{color:var(--accent)}
+#composer{
+  flex:none;border-top:1px solid var(--border);padding:12px 18px;
+  display:flex;align-items:center;gap:12px;
+}
+#composer input{
+  flex:1;border:1px solid var(--border);border-radius:14px;padding:13px 16px;
+  font:inherit;font-size:16px;background:#fff;color:var(--ink);
+}
+#composer input:focus{outline:2px solid rgba(217,119,87,.35);outline-offset:-1px}
+#send{
+  width:46px;height:46px;border-radius:50%;border:0;background:var(--blue);color:#fff;
+  font-size:20px;cursor:pointer;flex:none;
+}
+#send:disabled{opacity:.4;cursor:default}
+#term{flex:1;border:0;width:100%;background:#000;display:none}
+#empty{flex:1;display:grid;place-items:center;color:var(--muted);font-size:17px}
+@media(max-width:760px){
+  #side{position:absolute;z-index:5;height:100%;box-shadow:0 0 40px rgba(0,0,0,.18)}
+  #side.hide{display:none}
+}
+</style>
+
+<div id="app">
+  <aside id="side">
+    <div id="sideTop">
+      <div class="card" id="newBtn"><span style="color:var(--muted)">+</span><span class="grow">New session</span><span style="color:var(--muted)">⌄</span></div>
+      <div class="card" id="needsBtn"><span>⚡</span><span class="grow">Needs me</span><span class="badge" id="needsCount">0</span></div>
+    </div>
+    <div id="list"></div>
+  </aside>
+  <main id="main">
+    <div id="head">
+      <button id="sideToggle" style="border:0;background:transparent;font-size:19px;cursor:pointer;color:var(--muted)">▤</button>
+      <div id="headTitle">Ground Control</div>
+      <div class="seg" id="seg" style="display:none">
+        <button data-pane="chat" class="on">Chat</button>
+        <button data-pane="terminal">Terminal</button>
+      </div>
+      <div id="headIcons" style="display:none">
+        <span id="headRing"></span>
+        <button class="hicon" id="usageBtn" title="Usage">▮▮▮</button>
+        <button class="hicon" id="alertBtn" title="Alerts">🔔</button>
+        <button class="hicon" id="setBtn" title="Settings">⚙</button>
+      </div>
+    </div>
+    <div id="neterr" style="display:none;background:#D64545;color:#fff;padding:7px 18px;font-size:13px;font-weight:650"></div>
+    <div id="banner" style="display:none"></div>
+    <div id="feed"></div>
+    <iframe id="term"></iframe>
+    <div id="composer" style="display:none">
+      <button class="cicon" id="micBtn" title="Dictate">🎙</button>
+      <input id="msg" placeholder="Type a message" autocomplete="off">
+      <button id="send">↑</button>
+    </div>
+    <div id="statusbar">
+      <span class="pill">Bypass permissions</span>
+      <span id="sbRight"><span id="sbCtx"></span></span>
+    </div>
+    <div id="empty">Pick a session</div>
+  </main>
+  <div id="sheet"><div id="sheetBox"></div></div>
+</div>
+
+<script>
+const API = location.origin;
+const $ = s => document.querySelector(s);
+let groups = [], icons = {}, ctx = {}, gids = {}, sel = null, pane = "chat";
+let openGroups = JSON.parse(localStorage.getItem("gcOpen") || "null");
+let collapsedDiv = new Set(JSON.parse(localStorage.getItem("gcDiv") || "[]"));
+
+/* INVARIANT (.claude/rules/invariants.md §1): busy is shown as a CLIENT-CLOCK LEASE,
+   never the raw bool and never a server timestamp. Each poll that sees busy renews
+   busySince on OUR clock; the spinner shows while now-busySince < WINDOW. That gives
+   no flicker during work, self-healing when polls stop, and clock-skew immunity. */
+const WINDOW = 3000, busySince = {};
+
+let lastErr = 0;
+async function j(path, tries = 3){
+  let err;
+  for(let i = 0; i < tries; i++){
+    try{
+      const r = await fetch(API + path, {cache:"no-store"});
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      flagOK();
+      return await r.json();
+    }catch(e){
+      err = e;
+      await new Promise(r => setTimeout(r, 250 * (i + 1)));
+    }
+  }
+  flagErr(path + " — " + err.message);
+  throw err;
+}
+function flagErr(msg){
+  lastErr = Date.now();
+  const e = $("#neterr");
+  e.textContent = "connection trouble: " + msg;
+  e.style.display = "block";
+}
+function flagOK(){
+  if(lastErr && Date.now() - lastErr > 1500) $("#neterr").style.display = "none";
+}
+const PALETTE = ["#4C8DFF","#9B6BFF","#FF9F43","#22C3B6","#FF6FA5","#5FB865","#FF6B6B","#5C7CFA"];
+const palette = id => PALETTE[djb2(id) % PALETTE.length];
+function djb2(s){let h=5381;for(const c of new TextEncoder().encode(s))h=((h<<5)+h+c)|0;return Math.abs(h)}
+function avatar(id){
+  if(icons[id]) return `${API}/api/icon/${encodeURIComponent(id)}?v=${icons[id]}`;
+  const n = String(djb2(id)%8).padStart(2,"0");
+  return `${API}/api/robot/robot_${n}`;
+}
+function ago(ts){
+  if(!ts || ts < 1e6) return null;
+  const s = Date.now()/1000 - ts;
+  if(s<60) return "just now";
+  if(s<3600) return Math.floor(s/60)+"m ago";
+  if(s<86400) return Math.floor(s/3600)+"h ago";
+  return Math.floor(s/86400)+"d ago";
+}
+function ring(pct){
+  if(!pct || pct<=0) return "";
+  const r=13, c=2*Math.PI*r, on=c*Math.min(pct,100)/100;
+  const col = pct>=90 ? "#D64545" : pct>=70 ? "#D9954F" : "#B9B3A7";
+  return `<svg class="ring" width="29" height="29" viewBox="0 0 32 32">
+    <circle cx="16" cy="16" r="${r}" fill="none" stroke="var(--border)" stroke-width="3"/>
+    <circle cx="16" cy="16" r="${r}" fill="none" stroke="${col}" stroke-width="3"
+      stroke-linecap="round" stroke-dasharray="${on} ${c}" transform="rotate(-90 16 16)"/>
+    <text x="16" y="20" text-anchor="middle" font-size="10.5" font-weight="700"
+      fill="var(--muted)">${Math.round(pct)}</text></svg>`;
+}
+function statusOf(s, working){
+  if(working) return ["working…","working"];
+  if(s.jobsMoving>0) return ["running in the background",""];
+  const a = ago(s.mtime);
+  if(!a) return [s.unread?"waiting on you":"idle", s.unread?"new":""];
+  return [(s.unread?"waiting on you · ":"idle · ")+a, s.unread?"new":""];
+}
+
+function rowHTML(s){
+  const working = (Date.now() - (busySince[s.id]||0)) < WINDOW;
+  const [txt,cls] = statusOf(s, working);
+  const pct = ctx[s.id];
+  return `<div class="row ${sel&&sel.id===s.id?"sel":""}" data-id="${s.id}" data-dir="${s.dir}">
+    <img class="avatar" src="${avatar(s.id)}" loading="lazy"
+         onerror="this.outerHTML='<div class=&quot;ava&quot; style=&quot;background:${palette(s.id)}&quot;>${esc((s.title||"?").trim()[0]||"?")}</div>'">
+    ${working ? `<div class="spin"></div>` : `<div class="dot ${s.live?"live":""}"></div>`}
+    <div class="meta">
+      <div class="title ${s.unread?"unread":""}">${esc(s.title||"Untitled")}</div>
+      <div class="status ${cls}">${esc(txt)}</div>
+    </div>
+    ${ring(pct)}
+    ${s.jobsMoving>0?`<span class="jobs">⚙ ${s.jobsMoving}</span>`:""}
+    ${s.unread?`<span class="unread-dot"></span>`:""}
+  </div>`;
+}
+const esc = t => String(t??"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* Minimal markdown, matching what the native chat renders: fenced code, inline code,
+   bold, italic, headings, bullets and links. Escape FIRST, then add markup, so a
+   message containing HTML can never inject it. */
+function md(t){
+  let s = esc(t);
+  const blocks = [];
+  s = s.replace(/```([\s\S]*?)```/g, (_, c) => {
+    blocks.push(`<pre class="code">${c.replace(/^\n/, "")}</pre>`);
+    return `\u0000${blocks.length-1}\u0000`;
+  });
+  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  s = s.replace(/^###### (.*)$/gm, '<b>$1</b>')
+       .replace(/^#{1,5} (.*)$/gm, '<div class="h">$1</div>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  s = s.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?]|$)/g, '$1<i>$2</i>');
+  s = s.replace(/^[ \t]*[-*+] (.*)$/gm, '<div class="li">• $1</div>');
+  s = s.replace(/^[ \t]*(\d{1,2})[.)] (.*)$/gm, '<div class="li">$1. $2</div>');
+  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]);
+  return s;
+}
+
+function render(){
+  if(openGroups===null) openGroups = groups.map(g=>g.name);
+  let needs = 0;
+  const html = groups.map(g => {
+    const open = openGroups.includes(g.name);
+    const sess = g.sessions||[], divs = g.dividers||[];
+    needs += sess.filter(s=>s.unread).length;
+    let inner = "";
+    if(open){
+      inner = sess.map(rowHTML).join("");
+      for(const d of divs){
+        const id = d.id||d.name, hidden = collapsedDiv.has(id);
+        inner += `<div class="divider" data-div="${esc(id)}">
+          <span>${hidden?"›":"⌄"}</span><span>${esc(d.name||d.title||"")}</span><span class="line"></span></div>`;
+      }
+    }
+    const gid = gids[g.name];
+    const gsrc = gid && icons[gid]
+      ? `${API}/api/icon/${encodeURIComponent(gid)}?v=${icons[gid]}`
+      : avatar("group:"+g.name);
+    return `<div class="group">
+      <div class="ghead ${open?"open":""}" data-g="${esc(g.name)}">
+        <span class="chev">›</span>
+        <img class="gicon" src="${gsrc}" onerror="this.style.opacity=0">
+        <span>${esc(g.name)}</span>
+      </div>
+      <div class="gbox ${open&&inner?"":"empty"}">${inner}</div>
+    </div>`;
+  }).join("");
+  $("#list").innerHTML = html;
+  $("#needsCount").textContent = needs;
+}
+
+async function poll(){
+  try{
+    const d = await j("/api/sessions");
+    groups = d.groups||[];
+    const now = Date.now();
+    for(const g of groups) for(const s of (g.sessions||[])) if(s.busy) busySince[s.id] = now;
+    render();
+  }catch(e){}
+}
+async function slowPoll(){
+  try{ icons = await j("/api/icons"); }catch(e){}
+  try{
+    const g = await j("/api/groups");
+    gids = {};
+    for(const x of (g.groups||[])) gids[x.name] = x.id;
+  }catch(e){}
+  try{
+    const d = await j("/api/context-all");
+    const rows = Array.isArray(d) ? d : (d.sessions||d.context||[]);
+    ctx = {};
+    for(const r of (Array.isArray(rows)?rows:Object.values(rows))){
+      if(r && r.id) ctx[r.id] = r.pct ?? r.percent;
+    }
+  }catch(e){}
+}
+
+async function openSession(id, dir){
+  const s = groups.flatMap(g=>g.sessions||[]).find(x=>x.id===id);
+  if(!s) return;
+  sel = s; render();
+  $("#empty").style.display="none";
+  $("#seg").style.display="flex";
+  $("#headIcons").style.display="flex";
+  $("#statusbar").style.display="flex";
+  fetch(`${API}/api/seen/${s.id}`, {method:"POST"}).catch(()=>{});
+  $("#headTitle").textContent = s.title||"Untitled";
+  showPane(pane);
+  if(pane==="chat") await loadChat();
+}
+function showPane(p){
+  pane = p;
+  for(const b of document.querySelectorAll("#seg button")) b.classList.toggle("on", b.dataset.pane===p);
+  const chat = p==="chat";
+  $("#feed").style.display = chat?"block":"none";
+  $("#composer").style.display = chat?"flex":"none";
+  $("#term").style.display = chat?"none":"block";
+  $("#banner").style.display = chat?"flex":"none";
+  if(!chat && sel) $("#term").src = `${API}/terminal?name=${encodeURIComponent(sel.ezName||sel.id)}`;
+}
+async function loadChat(){
+  if(!sel) return;
+  try{
+    const d = await j(`/api/session/${sel.dir}/${sel.id}?limit=40`);
+    const working = (Date.now()-(busySince[sel.id]||0)) < WINDOW;
+    const b = $("#banner");
+    const jobs = d.jobs || 0;
+    const right = jobs > 0
+      ? `<span class="r">${jobs} background job${jobs>1?"s":""}</span>`
+      : (d.mtime ? `<span class="r">last reply ${ago(d.mtime)||""}</span>` : "");
+    b.innerHTML = (working
+      ? `<span>●</span><span>Working…</span>`
+      : `<span>⏸</span><span>Idle — nothing running</span>`) + right;
+    const pct = ctx[sel.id];
+    $("#headRing").innerHTML = ring(pct);
+    $("#sbCtx").textContent = pct ? Math.round(pct) + "% context" : "";
+    $("#feed").innerHTML = (d.turns||[]).map(t=>{
+      const imgs = (t.images||[]).map(u=>`<img src="${API}${u}">`).join("");
+      return `<div class="turn ${t.role==='user'?'user':''}">${md(t.text||"")}${imgs}</div>`;
+    }).join("");
+    $("#feed").scrollTop = $("#feed").scrollHeight;
+  }catch(e){}
+}
+async function send(){
+  const i=$("#msg"), text=i.value.trim();
+  if(!text||!sel) return;
+  i.value=""; $("#send").disabled=true;
+  try{
+    await fetch(`${API}/api/session/${sel.dir}/${sel.id}/send`,{
+      method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
+    busySince[sel.id]=Date.now();
+    setTimeout(loadChat, 1200);
+  }catch(e){ i.value=text; }
+  $("#send").disabled=false;
+}
+
+$("#list").addEventListener("click", e=>{
+  const g = e.target.closest(".ghead");
+  if(g){
+    const n=g.dataset.g;
+    openGroups = openGroups.includes(n) ? openGroups.filter(x=>x!==n) : [...openGroups,n];
+    localStorage.setItem("gcOpen", JSON.stringify(openGroups)); render(); return;
+  }
+  const dv = e.target.closest(".divider");
+  if(dv){
+    const id=dv.dataset.div;
+    collapsedDiv.has(id)?collapsedDiv.delete(id):collapsedDiv.add(id);
+    localStorage.setItem("gcDiv", JSON.stringify([...collapsedDiv])); render(); return;
+  }
+  const r = e.target.closest(".row");
+  if(r) openSession(r.dataset.id, r.dataset.dir);
+});
+$("#seg").addEventListener("click", e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  showPane(b.dataset.pane); if(b.dataset.pane==="chat") loadChat();
+});
+$("#send").addEventListener("click", send);
+$("#msg").addEventListener("keydown", e=>{ if(e.key==="Enter") send(); });
+$("#sideToggle").addEventListener("click", ()=> $("#side").classList.toggle("hide"));
+
+/* ---------- sheets (usage / alerts / new session) ---------- */
+const sheet = $("#sheet"), sheetBox = $("#sheetBox");
+function openSheet(html){ sheetBox.innerHTML = html; sheet.style.display = "flex"; }
+function closeSheet(){ sheet.style.display = "none"; }
+sheet.addEventListener("click", e => { if(e.target === sheet) closeSheet(); });
+document.addEventListener("keydown", e => { if(e.key === "Escape") closeSheet(); });
+
+$("#usageBtn").addEventListener("click", async () => {
+  openSheet("<h3>Usage</h3><div class='kv'>loading…</div>");
+  try{
+    const u = await j("/api/usage-summary");
+    const rows = [
+      ["This week", (u.week_pct ?? 0) + "%"],
+      ["5-hour window", (u.five_pct ?? 0) + "%"],
+      ["Week resets", (u.week_resets || "").slice(0,16).replace("T"," ")],
+    ].concat((u.scoped||[]).map(x => [x.name, x.pct + "%"]));
+    openSheet("<h3>Usage</h3>" + rows.map(([k,v]) =>
+      `<div class="kv"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("") +
+      `<p style="color:var(--muted);font-size:13px;margin-top:14px">Percent of plan — the meter that matters. Dollars only exist in overage.</p>`);
+  }catch(e){ openSheet("<h3>Usage</h3><p>Could not load usage.</p>"); }
+});
+
+$("#alertBtn").addEventListener("click", async () => {
+  openSheet("<h3>Alerts</h3><div class='kv'>loading…</div>");
+  try{
+    const a = await j("/api/settings");
+    const mins = s => s >= 60 ? (s/60) + "m" : s + "s";
+    openSheet(`<h3>Alerts</h3>
+      <div class="kv"><span>First alert after</span><b>${a.alert_delay ? mins(a.alert_delay) : "immediately"}</b></div>
+      <div class="kv"><span>Repeat every</span><b>${a.repeat_alert ? mins(a.repeat_alert) : "never"}</b></div>
+      <div class="kv"><span>Phone call after</span><b>${a.call_delay ? mins(a.call_delay) : "never"}</b></div>
+      <div class="kv"><span>Call number</span><b>${a.call_number ? "set" : "not set"}</b></div>
+      <p style="color:var(--muted);font-size:13px;margin-top:14px">Change these in the phone or Mac app — this view is read-only for now.</p>`);
+  }catch(e){ openSheet("<h3>Alerts</h3><p>Could not load settings.</p>"); }
+});
+
+$("#setBtn").addEventListener("click", () => {
+  openSheet(`<h3>Ground Control</h3>
+    <div class="kv"><span>Server</span><b>${esc(API)}</b></div>
+    <div class="kv"><span>Sessions</span><b>${groups.reduce((n,g)=>n+(g.sessions||[]).length,0)}</b></div>
+    <div class="kv"><span>Groups</span><b>${groups.length}</b></div>
+    <p style="color:var(--muted);font-size:13px;margin-top:14px">Web app — same server and endpoints as the native apps.</p>`);
+});
+
+$("#newBtn").addEventListener("click", () => {
+  openSheet(`<h3>New session</h3>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <input id="nsName" placeholder="Session name" style="padding:11px;border:1px solid var(--border);border-radius:11px;font:inherit">
+      <input id="nsCwd" placeholder="Folder (e.g. /Users/you/project)" style="padding:11px;border:1px solid var(--border);border-radius:11px;font:inherit">
+      <textarea id="nsText" rows="3" placeholder="First message (optional)" style="padding:11px;border:1px solid var(--border);border-radius:11px;font:inherit"></textarea>
+      <button id="nsGo" style="padding:11px;border:0;border-radius:11px;background:var(--accent);color:#fff;font:inherit;font-weight:700;cursor:pointer">Start</button>
+      <div id="nsErr" style="color:#D64545;font-size:13px"></div>
+    </div>`);
+  $("#nsGo").addEventListener("click", async () => {
+    const name = $("#nsName").value.trim(), cwd = $("#nsCwd").value.trim();
+    if(!name || !cwd){ $("#nsErr").textContent = "Name and folder are both required."; return; }
+    $("#nsGo").disabled = true;
+    try{
+      const r = await fetch(API + "/api/new-session", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({name, cwd, text: $("#nsText").value})});
+      const d = await r.json();
+      if(!r.ok || d.error) throw new Error(d.error || ("HTTP " + r.status));
+      closeSheet(); await poll();
+    }catch(e){ $("#nsErr").textContent = e.message; $("#nsGo").disabled = false; }
+  });
+});
+
+$("#needsBtn").addEventListener("click", () => {
+  const n = groups.flatMap(g => g.sessions||[]).find(s => s.unread);
+  if(n) openSession(n.id, n.dir);
+});
+
+/* ---------- dictation ----------
+   The same "hold the thought" flow the phone has: start talking, keep talking, stop,
+   and the recording goes to /api/transcribe (Whisper, Gemini as backstop) and lands
+   in the composer rather than being sent blind. */
+let rec = null, chunks = [];
+$("#micBtn").addEventListener("click", async () => {
+  if(rec && rec.state === "recording"){ rec.stop(); return; }
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    chunks = []; rec = new MediaRecorder(stream);
+    rec.ondataavailable = e => chunks.push(e.data);
+    rec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      $("#micBtn").classList.remove("rec");
+      $("#micBtn").textContent = "⏳";
+      try{
+        const fd = new FormData();
+        fd.append("file", new Blob(chunks, {type:"audio/webm"}), "memo.webm");
+        const r = await fetch(API + "/api/transcribe", {method:"POST", body: fd});
+        const d = await r.json();
+        if(d.text){ const m = $("#msg"); m.value = (m.value ? m.value + " " : "") + d.text; m.focus(); }
+        else flagErr("transcribe: " + (d.error || "no text"));
+      }catch(e){ flagErr("transcribe failed"); }
+      $("#micBtn").textContent = "🎙";
+    };
+    rec.start();
+    $("#micBtn").classList.add("rec");
+    $("#micBtn").textContent = "⏹";
+  }catch(e){ flagErr("microphone blocked"); }
+});
+
+/* Deep link: /app?s=<session id> opens straight into a session. Useful on its own
+   (a push notification can link right at the thread) and it makes the app testable
+   without synthetic clicks. */
+async function bootDeepLink(){
+  const q = new URLSearchParams(location.search);
+  const want = q.get("s");
+  if(q.get("pane") === "terminal") pane = "terminal";
+  if(!want) return;
+  for(let i=0;i<20 && !sel;i++){
+    const hit = groups.flatMap(g=>g.sessions||[]).find(x=>x.id===want||x.id.startsWith(want));
+    if(hit){ await openSession(hit.id, hit.dir); return; }
+    await new Promise(r=>setTimeout(r,400));
+  }
+}
+poll().then(bootDeepLink);
+slowPoll();
+// The 60s timer is right for steady state, but an empty icon map at boot means the
+// first call lost a race with page load — retry quickly rather than show robots for a minute.
+(async () => {
+  for(let i = 0; i < 6 && !Object.keys(icons).length; i++){
+    await new Promise(r => setTimeout(r, 1200));
+    await slowPoll();
+  }
+})();
+setInterval(poll, 1500);
+setInterval(slowPoll, 60000);
+setInterval(()=>{ if(sel && pane==="chat") loadChat(); }, 4000);
+</script>

@@ -3436,6 +3436,22 @@ def usage_page():
     return FileResponse(STATIC_DIR / "usage.html")
 
 
+@app.get("/app")
+def app_page():
+    # The full Ground Control UI as a web app. The native apps are SwiftUI and cannot
+    # run on Windows, so this is how a PC gets the real thing — same palette and the
+    # same endpoints, not a lookalike. Never cached: same reasoning as /terminal, a
+    # stale copy means fixes silently do not reach the browser.
+    return FileResponse(STATIC_DIR / "app.html",
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                                 "Pragma": "no-cache", "Expires": "0"})
+
+
+@app.get("/static/app.webmanifest")
+def app_manifest():
+    return FileResponse(STATIC_DIR / "app.webmanifest", media_type="application/manifest+json")
+
+
 @app.get("/groundzero")
 def groundzero_page():
     return FileResponse(STATIC_DIR / "groundzero.html")
@@ -6609,13 +6625,107 @@ def _relay_tts(text: str, voice: str) -> bytes:
     return b""
 
 
+# --- Read-aloud text hygiene -------------------------------------------------
+# Read-aloud used to speak a message VERBATIM, so a normal engineering reply —
+# which is mostly backticked paths, shell commands, URLs and build ids — came out
+# as "see slash Users slash philipbuonforte slash claude dash workspace slash…",
+# one slash at a time, for minutes (Phil, reading a chat in bed, 2026-11-06).
+# `_speakable` keeps the prose and the FILENAME (hearing "ChatView.swift, line
+# 3497" is useful) and drops the 90 characters of directory leading to it.
+# It runs on the SERVER so both apps get it with no rebuild, and it runs before
+# the cache key so identical prose dedupes.
+_SPK_FENCE  = re.compile(r"```.*?```|~~~.*?~~~", re.S)
+_SPK_MDIMG  = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_SPK_MDLINK = re.compile(r"\[([^\]]*)\]\(([^)]*)\)")
+_SPK_TABLE  = re.compile(r"^[ \t]*\|.*\|[ \t]*$", re.M)
+_SPK_RULE   = re.compile(r"^[ \t]*(?:-{3,}|={3,}|\*{3,})[ \t]*$", re.M)
+_SPK_URL    = re.compile(r"\b(?:https?://|www\.)\S+")
+_SPK_HEXID  = re.compile(r"\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{12,})\b")
+_SPK_ABSPATH = re.compile(r"(?<![\w.])(?:~|\.{1,2})?/[\w.\-+@/]{2,}")
+_SPK_RELPATH = re.compile(r"(?<![\w./])(?:[\w.\-+@]+/){1,}[\w.\-+@]+\.[A-Za-z0-9]{1,6}\b")
+_SPK_LINENO  = re.compile(r"(\.[A-Za-z0-9]{1,6}):(\d+)\b")
+_SPK_CMDWORD = re.compile(r"^(?:cd|ls|cat|head|tail|grep|rg|sed|awk|curl|wget|git|npm|npx|yarn|pip3?|xcodebuild|xcrun|launchctl|systemctl|python3?|node|chmod|chown|mkdir|rmdir|rm|cp|mv|ln|kill|pkill|sudo|brew|ssh|scp|docker|make|open|defaults|codesign|plutil|lsof|ps|top|echo|export|source)$")
+_SPK_BULLET = re.compile(r"^[ \t]{0,8}(?:[-*+]|\d{1,2}[.)])[ \t]+", re.M)
+_SPK_HEAD   = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*", re.M)
+_SPK_EMPH   = re.compile(r"(\*\*|__|\*|_|~~)")
+_SPK_WS     = re.compile(r"[ \t]+")
+_SPK_BLANK  = re.compile(r"\n{2,}")
+_SPK_SHELLY = ("&&", "||", "$(", "2>&1", "|", ";", "--")
+_SPK_INLINE = re.compile(r"`([^`\n]+)`")
+
+
+def _spk_basename(m):
+    p = m.group(0).rstrip("/.,;:")
+    name = p.rsplit("/", 1)[-1]
+    return name if name and name not in (".", "..", "~") else "a file path"
+
+
+def _spk_is_command(line: str) -> bool:
+    """A line that is shell, not speech. Two independent signals, so prose that merely
+    MENTIONS git ("git is a great tool") is still read aloud: the line either starts
+    with a command word, or it is dense with shell punctuation."""
+    s = line.strip()
+    if not s:
+        return False
+    first = s.split()[0].lstrip("$>#").strip()
+    if _SPK_CMDWORD.match(first):
+        return True
+    return sum(tok in s for tok in _SPK_SHELLY) >= 2 and len(s.split()) > 2
+
+
+def _spk_inline(m):
+    """One `backticked` span. Line-level detection cannot see these: an inline command
+    usually sits mid-sentence ("Run `cd /x && grep y` to see it"), where the line starts
+    with prose. Judge the span on its own, so a span that is a command becomes a short
+    marker, a span that is a path becomes its filename, and `kbHeight` stays spoken."""
+    inner = m.group(1).strip()
+    if _spk_is_command(inner):
+        return " a command "
+    if "/" in inner:
+        return _SPK_ABSPATH.sub(_spk_basename, _SPK_RELPATH.sub(_spk_basename, inner))
+    return inner
+
+
+def _speakable(text: str, limit: int = 4000) -> str:
+    """Message text -> what a human actually wants to hear."""
+    t = text or ""
+    t = _SPK_FENCE.sub(" Code block. ", t)
+    t = _SPK_MDIMG.sub(" ", t)
+    t = _SPK_MDLINK.sub(r"\1", t)
+    t = _SPK_TABLE.sub(" ", t)
+    t = _SPK_RULE.sub(" ", t)
+    t = _SPK_INLINE.sub(_spk_inline, t)   # judge each `span` on its own merits
+    t = t.replace("`", "")                # strays (unbalanced, or spanning a newline)
+    t = _SPK_URL.sub(" link ", t)
+    t = _SPK_HEXID.sub(" an id ", t)
+    out = []
+    for ln in t.split("\n"):
+        if _spk_is_command(ln):
+            if not out or out[-1].strip() != "A command.":
+                out.append("A command.")
+        else:
+            out.append(ln)
+    t = "\n".join(out)
+    t = _SPK_LINENO.sub(r"\1 line \2", t)
+    t = _SPK_ABSPATH.sub(_spk_basename, t)
+    t = _SPK_RELPATH.sub(_spk_basename, t)
+    t = _SPK_HEAD.sub("", t)
+    t = _SPK_BULLET.sub("", t)
+    t = _SPK_EMPH.sub("", t)
+    t = _SPK_WS.sub(" ", t)
+    t = _SPK_BLANK.sub("\n", t)
+    return t.strip()[:limit]
+
+
 @app.post("/api/tts")
 def tts(body: TTSBody):
     """Text → natural speech via OpenAI. Returns MP3 bytes."""
     from fastapi import Response
 
     global _openai_cold_until
-    text = body.text.strip()[:4000]
+    raw = body.text or ""
+    text = _speakable(raw)
+    print(f"[tts] speakable {len(raw)}->{len(text)} chars: {text[:90]!r}", flush=True)
     if not text:
         return JSONResponse({"error": "no text"}, status_code=400)
     cache_key = (hash(text), body.voice)
@@ -6681,8 +6791,11 @@ def tts_batch(body: TTSBatchBody):
     """Register a run of messages for streaming playback; returns a stable id per text
     ('' for empties). The app then GET-streams /api/tts-stream/{id} for each, in order."""
     ids = []
+    _spk_raw = _spk_out = 0
     for t in body.texts:
-        t = (str(t) if t is not None else "").strip()[:4000]
+        _raw = str(t) if t is not None else ""
+        t = _speakable(_raw)
+        _spk_raw += len(_raw); _spk_out += len(t)
         if not t:
             ids.append("")
             continue
@@ -6692,6 +6805,7 @@ def tts_batch(body: TTSBatchBody):
     if len(_tts_reg) > 400:                       # bound memory — keep the most recent
         for k in list(_tts_reg)[:-400]:
             _tts_reg.pop(k, None)
+    print(f"[tts] batch {len(ids)} chunks, speakable {_spk_raw}->{_spk_out} chars", flush=True)
     return {"ids": ids}
 
 
